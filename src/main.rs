@@ -15,6 +15,7 @@ mod terminal_graphics;
 mod ui;
 
 use creamui_render::{AppBuilder, BlurRegion, CompositorIntegrationRequest, WindowOptions};
+use creamui_theme_watch::ThemeListener;
 use std::sync::{mpsc, Arc, Mutex};
 
 fn main() -> Result<(), String> {
@@ -56,7 +57,7 @@ fn run_terminal(cwd: std::path::PathBuf, command: Vec<String>) {
     let window = state.window.clone();
     let ready = window.clone();
     let events = Arc::new(Mutex::new(receiver));
-    let theme_events = Arc::new(Mutex::new(appearance::listen_for_theme_reloads()));
+    let theme_events = Arc::new(Mutex::new(ThemeListener::start()));
     let opts = options("Terminal", 1000, 680);
     AppBuilder::new()
         .on_started(move |app| {
@@ -84,7 +85,7 @@ fn run_settings() {
     let window = state.window.clone();
     let ready = window.clone();
     let keys = state.clone();
-    let theme_events = Arc::new(Mutex::new(appearance::listen_for_theme_reloads()));
+    let theme_events = Arc::new(Mutex::new(ThemeListener::start()));
     let opts = options("Terminal Settings", 720, 640);
     AppBuilder::new()
         .on_started(move |app| {
