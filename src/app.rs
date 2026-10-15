@@ -1,0 +1,936 @@
+use crate::{
+    chrome,
+    config::Config,
+    screen::{Metrics, Selection, TerminalScreen},
+    shortcuts::{Action, Binding},
+    terminal::{Event, Session},
+    ui::*,
+};
+use creamui_core::{
+    layout::{Dimension, Style},
+    BoxedWidget, Size, StateStyle, Styled,
+};
+use creamui_reactive::Signal;
+use creamui_render::{
+    platform::{KeyEvent, Modifiers},
+    AppHandle, WindowHandle,
+};
+use creamui_theme::use_theme;
+use creamui_widgets::{CUIWindowDragArea, Icon, RawButton, RawView, Symbol, Text};
+use std::{
+    cell::RefCell,
+    path::PathBuf,
+    rc::Rc,
+    sync::{
+        mpsc::{Receiver, SyncSender},
+        Arc, Mutex,
+    },
+};
+
+#[derive(Clone)]
+struct Tab {
+    session: Rc<RefCell<Session>>,
+    selection: Signal<Option<Selection>>,
+}
+#[derive(Clone)]
+pub struct State {
+    tabs: Signal<Vec<Tab>>,
+    active: Signal<usize>,
+    next_id: Rc<std::cell::Cell<u64>>,
+    revision: Signal<u64>,
+    error: Signal<Option<String>>,
+    sender: SyncSender<Event>,
+    cwd: PathBuf,
+    command: Vec<String>,
+    config: Signal<Config>,
+    bindings: Rc<RefCell<Vec<(Action, Binding)>>>,
+    metrics: Metrics,
+    pub window: Rc<RefCell<Option<WindowHandle>>>,
+    maximized: Signal<bool>,
+    clipboard: Rc<RefCell<Option<arboard::Clipboard>>>,
+}
+impl State {
+    pub fn new(cwd: PathBuf, command: Vec<String>, sender: SyncSender<Event>) -> Self {
+        Self {
+            tabs: Signal::new(Vec::new()),
+            active: Signal::new(0),
+            next_id: Rc::new(std::cell::Cell::new(1)),
+            revision: Signal::new(0),
+            error: Signal::new(None),
+            sender,
+            cwd,
+            command,
+            config: Signal::new(Config::default()),
+            bindings: Rc::new(RefCell::new(
+                Config::default().bindings().expect("default shortcuts"),
+            )),
+            metrics: Metrics::load(),
+            window: Rc::new(RefCell::new(None)),
+            maximized: Signal::new(false),
+            clipboard: Rc::new(RefCell::new(None)),
+        }
+    }
+    pub fn add(&self) {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let command = if self.command.is_empty() {
+            self.config.peek().shell_command()
+        } else {
+            Ok(self.command.clone())
+        };
+        let result = command.and_then(|command| {
+            Session::spawn(id, &self.cwd, &command, self.sender.clone())
+                .map_err(|e| format!("{e:#}"))
+        });
+        match result {
+            Ok(session) => {
+                let index = self.tabs.peek().len();
+                self.tabs.update(|tabs| {
+                    tabs.push(Tab {
+                        session: Rc::new(RefCell::new(session)),
+                        selection: Signal::new(None),
+                    })
+                });
+                self.active.set(index);
+                self.error.set(None);
+            }
+            Err(e) => self
+                .error
+                .set(Some(format!("Couldn't open terminal: {e:#}"))),
+        }
+    }
+    fn close(&self, index: usize) {
+        let mut tabs = self.tabs.peek();
+        if index >= tabs.len() {
+            return;
+        }
+        tabs.remove(index);
+        if tabs.is_empty() {
+            if let Some(window) = self.window.borrow().as_ref() {
+                window.close();
+            }
+        }
+        let old = self.active.peek();
+        let next = if index < old {
+            old - 1
+        } else {
+            old.min(tabs.len().saturating_sub(1))
+        };
+        self.tabs.set(tabs);
+        self.active.set(next);
+    }
+    pub fn cleanup(&self) {
+        self.tabs.set(Vec::new());
+        self.window.borrow_mut().take();
+    }
+    fn current(&self) -> Option<Tab> {
+        self.tabs.peek().get(self.active.peek()).cloned()
+    }
+    fn report(&self, result: anyhow::Result<()>) {
+        if let Err(e) = result {
+            let message = e.to_string();
+            if self.error.peek().as_ref() != Some(&message) {
+                self.error.set(Some(message));
+            }
+        }
+    }
+    fn paste(&self) {
+        self.ensure_clipboard();
+        let text = self
+            .clipboard
+            .borrow_mut()
+            .as_mut()
+            .and_then(|c| c.get_text().ok());
+        if let Some(text) = text {
+            self.paste_text(&text);
+        }
+    }
+    fn paste_text(&self, text: &str) {
+        if let Some(tab) = self.current() {
+            let result = {
+                let mut session = tab.session.borrow_mut();
+                let bracketed = session.parser.screen().bracketed_paste();
+                session.parser.screen_mut().set_scrollback(0);
+                session.write(crate::input::paste(text, bracketed))
+            };
+            self.input_changed(&tab, result);
+        }
+    }
+    /// Signals can redraw synchronously: callers must release the session first.
+    fn input_changed(&self, tab: &Tab, result: anyhow::Result<()>) {
+        creamui_reactive::batch(|| {
+            tab.selection.set(None);
+            self.report(result);
+            self.revision.update(|v| *v = v.wrapping_add(1));
+        });
+    }
+    fn ensure_clipboard(&self) {
+        if self.clipboard.borrow().is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => *self.clipboard.borrow_mut() = Some(c),
+                Err(e) => self.error.set(Some(format!("Clipboard unavailable: {e}"))),
+            }
+        }
+    }
+    fn copy(&self) {
+        if let Some(tab) = self.current() {
+            if let Some(selection) = tab.selection.peek() {
+                let text = selection.text(tab.session.borrow().parser.screen());
+                if !text.is_empty() {
+                    self.ensure_clipboard();
+                    if let Some(c) = self.clipboard.borrow_mut().as_mut() {
+                        if let Err(e) = c.set_text(text) {
+                            self.error.set(Some(e.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pub fn key(&self, event: KeyEvent, m: Modifiers) -> bool {
+        if !event.pressed {
+            return true;
+        }
+        let action = self
+            .bindings
+            .borrow()
+            .iter()
+            .find(|(_, binding)| binding.matches(&event.key, m))
+            .map(|(action, _)| *action);
+        if let Some(action) = action {
+            self.dispatch(action);
+            return true;
+        }
+        if let Some(tab) = self.current() {
+            let result = {
+                let mut session = tab.session.borrow_mut();
+                let bytes = crate::input::encode(
+                    &event.key,
+                    m,
+                    session.parser.screen().application_cursor(),
+                );
+                if bytes.is_empty() {
+                    return true;
+                }
+                session.parser.screen_mut().set_scrollback(0);
+                session.write(bytes)
+            };
+            self.input_changed(&tab, result);
+        }
+        true
+    }
+    pub fn configure(&self, config: Config) {
+        match config.bindings() {
+            Ok(bindings) => {
+                *self.bindings.borrow_mut() = bindings;
+                self.config.set(config);
+            }
+            Err(error) => self.show_error(error),
+        }
+    }
+    pub fn show_error(&self, message: String) {
+        self.error.set(Some(message));
+    }
+    fn dispatch(&self, action: Action) {
+        match action {
+            Action::NewTab => self.add(),
+            Action::NewWindow => self.new_window(),
+            Action::CloseTab => self.close(self.active.peek()),
+            Action::NextTab => self.switch(1),
+            Action::PreviousTab => self.switch(-1),
+            Action::SelectTab(index) => {
+                if (1..=self.tabs.peek().len()).contains(&index) {
+                    self.active.set(index - 1);
+                }
+            }
+            Action::Copy => self.copy(),
+            Action::Paste => self.paste(),
+            Action::Settings => open_settings(),
+            Action::ScrollUp | Action::ScrollDown => {
+                if let Some(tab) = self.current() {
+                    let mut s = tab.session.borrow_mut();
+                    if s.parser.screen().alternate_screen() {
+                        return;
+                    }
+                    let rows = s.parser.screen().size().0 as usize;
+                    let old = s.parser.screen().scrollback();
+                    let offset = if action == Action::ScrollUp {
+                        old + rows
+                    } else {
+                        old.saturating_sub(rows)
+                    };
+                    s.parser.screen_mut().set_scrollback(offset);
+                    drop(s);
+                    self.input_changed(&tab, Ok(()));
+                }
+            }
+        }
+    }
+    fn new_window(&self) {
+        let result = std::env::current_exe().and_then(|exe| {
+            let mut command = std::process::Command::new(exe);
+            command.arg("--working-directory").arg(&self.cwd);
+            if !self.command.is_empty() {
+                command.arg("-e").args(&self.command);
+            }
+            command.spawn()
+        });
+        match result {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(error) => self.show_error(format!("Couldn't open a new window: {error}")),
+        }
+    }
+    fn switch(&self, direction: isize) {
+        let n = self.tabs.peek().len();
+        if n > 0 {
+            self.active
+                .set((self.active.peek() as isize + direction).rem_euclid(n as isize) as usize);
+        }
+    }
+    fn event(&self, event: Event) {
+        let id = match &event {
+            Event::Configuration(_) => {
+                if let Event::Configuration(result) = event {
+                    match result {
+                        Ok(config) => self.configure(config),
+                        Err(error) => self.show_error(error),
+                    }
+                }
+                return;
+            }
+            Event::Output(id, _) | Event::Exited(id, _) => *id,
+        };
+        if let Some(tab) = self
+            .tabs
+            .peek()
+            .iter()
+            .find(|t| t.session.borrow().id == id)
+        {
+            match event {
+                Event::Output(_, bytes) => {
+                    let result = tab.session.borrow_mut().process(&bytes);
+                    creamui_reactive::batch(|| {
+                        tab.selection.set(None);
+                        self.report(result);
+                    });
+                }
+                Event::Exited(_, status) => tab.session.borrow_mut().finish(status),
+                Event::Configuration(_) => unreachable!(),
+            }
+        }
+    }
+    pub fn build(&self, size: Size) -> BoxedWidget {
+        self.revision.get();
+        let theme = use_theme();
+        let tabs = self.tabs.get();
+        let active = self.active.get();
+        let error = self.error.get();
+        let exited = tabs
+            .get(active)
+            .and_then(|t| t.session.borrow().exited.clone());
+        let status = error
+            .clone()
+            .or_else(|| exited.map(|s| format!("{s} · Close this tab or open a new one.")));
+        let screen_height =
+            (size.height - chrome::HEADER - if status.is_some() { 36.0 } else { 0.0 }).max(1.0);
+        let (rows, cols) = self.metrics.size(size.width, screen_height);
+        for tab in &tabs {
+            let result = tab.session.borrow_mut().resize(rows, cols);
+            self.report(result);
+        }
+        let mut children = vec![self.header(size.width)];
+        if let Some(tab) = tabs.get(active) {
+            children.push(Box::new(TerminalScreen {
+                session: tab.session.clone(),
+                selection: tab.selection.clone(),
+                revision: self.revision.clone(),
+                metrics: self.metrics,
+            }));
+        } else {
+            let retry = self.clone();
+            children.push(view(
+                Style {
+                    flex_grow: 1.0,
+                    ..pad(column(16.0), 24.0, 24.0)
+                },
+                vec![
+                    Box::new(Text::secondary("Open a terminal to start working.")),
+                    button("+", 40.0, move || retry.add()),
+                ],
+            ));
+        }
+        if let Some(status) = status {
+            let dismiss = self.clone();
+            children.push(Box::new(
+                RawView::new(pad(
+                    Style {
+                        size: creamui_core::layout::Size {
+                            width: Dimension::Percent(1.0),
+                            height: Dimension::Length(36.0),
+                        },
+                        ..row(8.0)
+                    },
+                    14.0,
+                    0.0,
+                ))
+                .background(theme.colors.surface_elevated)
+                .with_children(vec![
+                    Box::new(Text::secondary(status).font_size(12.0).layout(Style {
+                        flex_grow: 1.0,
+                        flex_basis: Dimension::Length(0.0),
+                        ..Default::default()
+                    })),
+                    button("×", 28.0, move || {
+                        if error.is_some() {
+                            dismiss.error.set(None)
+                        } else {
+                            dismiss.close(dismiss.active.peek())
+                        }
+                    }),
+                ]),
+            ));
+        }
+        Box::new(
+            RawView::new(Style {
+                size: creamui_core::layout::Size {
+                    width: Dimension::Length(size.width),
+                    height: Dimension::Length(size.height),
+                },
+                ..column(0.0)
+            })
+            .background(theme.colors.surface)
+            .with_children(children),
+        )
+    }
+    fn actions(&self) -> BoxedWidget {
+        let theme = use_theme();
+        let add = self.clone();
+        view(
+            fixed(70.0, 34.0),
+            vec![
+                Box::new(
+                    RawButton::new(
+                        Style {
+                            justify_content: Some(creamui_core::layout::JustifyContent::Center),
+                            ..fixed(34.0, 34.0)
+                        },
+                        open_settings,
+                    )
+                    .corner_radius(8.0)
+                    .hover_style(StateStyle::new().background(theme.colors.surface_hover))
+                    .focus_style(StateStyle::new().outline(theme.colors.accent, 2.0))
+                    .child(Box::new(
+                        Icon::new(Symbol::Sliders, theme.colors.text_secondary).size(17.0),
+                    )),
+                ),
+                button("+", 34.0, move || add.add()),
+            ],
+        )
+    }
+    fn tab_title(tab: &Tab) -> String {
+        let session = tab.session.borrow();
+        let title = &session.parser.callbacks().title;
+        if !title.is_empty() {
+            title.clone()
+        } else if session.exited.is_some() {
+            "Exited".into()
+        } else {
+            "Terminal".into()
+        }
+    }
+    fn header(&self, width: f32) -> BoxedWidget {
+        let theme = use_theme();
+        let (start, end) = chrome::insets(width, chrome::HEADER);
+        let actions_right = start > 0.0;
+        let actions_x = if actions_right { width - 78.0 } else { 8.0 };
+        let left = start + 8.0 + if actions_right { 0.0 } else { 76.0 };
+        let right = width - end - 8.0 - if actions_right { 76.0 } else { 0.0 };
+        let mut children = Vec::new();
+        if !actions_right {
+            children.push(view(
+                positioned(fixed(70.0, 34.0), actions_x, 5.0),
+                vec![self.actions()],
+            ));
+        }
+        let tabs = self.tabs.get();
+        let active = self.active.get().min(tabs.len().saturating_sub(1));
+        if tabs.len() <= 1 {
+            let title = tabs
+                .first()
+                .map(Self::tab_title)
+                .unwrap_or_else(|| "Terminal".into());
+            let (x, available) = chrome::centered(width, left - 8.0, width - right - 8.0, 400.0);
+            let max_chars = (available / 7.0).floor().max(1.0) as usize;
+            let title = if title.chars().count() > max_chars {
+                format!(
+                    "{}…",
+                    title
+                        .chars()
+                        .take(max_chars.saturating_sub(1))
+                        .collect::<String>()
+                )
+            } else {
+                title
+            };
+            children.push(Box::new(
+                Text::new(title)
+                    .font_size(13.0)
+                    .text_align(creamui_core::TextAlign::Center)
+                    .layout(positioned(fixed(available, chrome::HEADER), x, 0.0)),
+            ));
+        } else {
+            let available = (right - left).max(1.0);
+            let capacity = ((available - 64.0) / 92.0).floor().max(1.0) as usize;
+            let paged = tabs.len() > capacity;
+            let first = if paged {
+                active / capacity * capacity
+            } else {
+                0
+            };
+            let last = (first + capacity).min(tabs.len());
+            let count = (last - first).max(1);
+            let maximum =
+                ((available - if paged { 64.0 } else { 0.0 }) / count as f32 - 4.0).max(44.0);
+            let mut strip = Vec::new();
+            if paged {
+                let state = self.clone();
+                strip.push(button("‹", 28.0, move || state.switch(-1)));
+            }
+            for (index, tab) in tabs.iter().enumerate().take(last).skip(first) {
+                let title = Self::tab_title(tab);
+                let tab_width = (title.chars().count() as f32 * 7.0 + 44.0)
+                    .clamp(76.0, 180.0)
+                    .min(maximum);
+                let max_chars = ((tab_width - 44.0) / 7.0).floor().max(1.0) as usize;
+                let title = if title.chars().count() > max_chars {
+                    format!(
+                        "{}…",
+                        title
+                            .chars()
+                            .take(max_chars.saturating_sub(1))
+                            .collect::<String>()
+                    )
+                } else {
+                    title
+                };
+                let choose = self.clone();
+                let close = self.clone();
+                strip.push(Box::new(
+                    RawView::new(fixed(tab_width, 34.0))
+                        .background(if index == active {
+                            theme.colors.surface_elevated
+                        } else {
+                            CLEAR
+                        })
+                        .corner_radius(8.0)
+                        .with_children(vec![
+                            Box::new(
+                                RawButton::new(
+                                    pad(fixed((tab_width - 28.0).max(0.0), 34.0), 8.0, 0.0),
+                                    move || choose.active.set(index),
+                                )
+                                .corner_radius(8.0)
+                                .focus_style(StateStyle::new().outline(theme.colors.accent, 2.0))
+                                .child(Box::new(
+                                    Text::new(title).font_size(12.0).color(if index == active {
+                                        theme.colors.text_primary
+                                    } else {
+                                        theme.colors.text_secondary
+                                    }),
+                                )),
+                            ),
+                            button("×", 28.0, move || close.close(index)),
+                        ]),
+                ) as BoxedWidget);
+            }
+            if paged {
+                let state = self.clone();
+                strip.push(button("›", 28.0, move || state.switch(1)));
+            }
+            children.push(view(
+                positioned(
+                    Style {
+                        ..fixed(available, 34.0)
+                    },
+                    left,
+                    5.0,
+                ),
+                vec![view(row(4.0), strip)],
+            ));
+        }
+        if actions_right {
+            children.push(view(
+                positioned(fixed(70.0, 34.0), actions_x, 5.0),
+                vec![self.actions()],
+            ));
+        }
+        if let Some(controls) = chrome::controls(&self.window, &self.maximized) {
+            children.push(view(
+                positioned(fixed(104.0, 34.0), width - 112.0, 5.0),
+                vec![controls],
+            ));
+        }
+        Box::new(
+            CUIWindowDragArea::new()
+                .layout(fixed(width, chrome::HEADER))
+                .background(theme.colors.surface.mix(theme.colors.accent, 0.025))
+                .with_children(children),
+        )
+    }
+}
+
+pub fn open_settings() {
+    match std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).arg("--settings").spawn())
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => eprintln!("Couldn't open settings: {e}"),
+    }
+}
+pub fn watch(app: AppHandle, events: Arc<Mutex<Receiver<Event>>>, state: State) {
+    let next_app = app.clone();
+    let next_events = events.clone();
+    app.spawn_background(
+        move || {
+            let receiver = events.lock().unwrap();
+            let Ok(first) = receiver.recv() else {
+                return Vec::new();
+            };
+            let mut batch = vec![first];
+            // Coalesce bursts, bound each update so output cannot starve UI input.
+            batch.extend(receiver.try_iter().take(63));
+            batch
+        },
+        move |batch| {
+            if batch.is_empty() {
+                return;
+            }
+            creamui_reactive::batch(|| {
+                for event in batch {
+                    state.event(event);
+                }
+                state.revision.update(|v| *v = v.wrapping_add(1));
+            });
+            watch(next_app, next_events, state);
+        },
+    );
+}
+
+/// Keep settings saved by a separate --settings process live in every window.
+pub fn watch_configuration(sender: SyncSender<Event>) {
+    let mut previous = crate::config::fingerprint();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let current = crate::config::fingerprint();
+        if current != previous {
+            previous = current;
+            if sender.send(Event::Configuration(Config::load())).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use creamui_core::{Point, Renderer};
+    use creamui_render::platform::Key;
+    use creamui_render::{
+        CompositorControls, Damage, Rasterizer, SceneRecorder, WindowDecorationMode,
+        WindowDecorations,
+    };
+    use creamui_theme::{Theme, ThemeProvider};
+    #[test]
+    fn terminal_input_and_scrolling_can_trigger_an_immediate_reactive_redraw() {
+        creamui_reactive::with_context_scope(|| {
+            creamui_reactive::provide_context(ThemeProvider::new(Theme::light()));
+            creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
+            let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+            let state = State::new("/tmp".into(), vec!["/bin/cat".into()], tx);
+            state.add();
+            let renders = Rc::new(std::cell::Cell::new(0));
+            let render_state = state.clone();
+            let count = renders.clone();
+            let effect = creamui_reactive::create_effect(move || {
+                if let Some(tab) = render_state.current() {
+                    tab.selection.get();
+                }
+                let _tree = render_state.build(Size {
+                    width: 800.0,
+                    height: 600.0,
+                });
+                count.set(count.get() + 1);
+            });
+            state.key(
+                KeyEvent {
+                    key: Key::Character("x".into()),
+                    pressed: true,
+                    synthetic: false,
+                },
+                Modifiers::default(),
+            );
+            state.key(
+                KeyEvent {
+                    key: Key::Enter,
+                    pressed: true,
+                    synthetic: false,
+                },
+                Modifiers::default(),
+            );
+            state.paste_text("pasted text\n");
+            state.dispatch(Action::ScrollUp);
+            let tab = state.current().unwrap();
+            let screen = TerminalScreen {
+                session: tab.session.clone(),
+                selection: tab.selection.clone(),
+                revision: state.revision.clone(),
+                metrics: state.metrics,
+            };
+            creamui_core::Widget::on_scroll(&screen).unwrap()(-40.0);
+            let id = tab.session.borrow().id;
+            state.event(Event::Output(id, b"output".to_vec()));
+            assert!(
+                renders.get() > 3,
+                "input should actually redraw the subscribed UI"
+            );
+            drop(effect);
+            state.cleanup();
+        });
+    }
+
+    #[test]
+    fn single_session_has_centered_title_and_actions_opposite_window_controls() {
+        for (appearance, theme) in [("light", Theme::light()), ("dark", Theme::dark())] {
+            creamui_reactive::with_context_scope(|| {
+                creamui_reactive::provide_context(ThemeProvider::new(theme));
+                let decorations = Signal::new(WindowDecorations::default());
+                creamui_reactive::provide_context(decorations.clone());
+                let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+                let state = State::new("/tmp".into(), vec!["/bin/cat".into()], tx);
+                state.add();
+                state
+                    .current()
+                    .unwrap()
+                    .session
+                    .borrow_mut()
+                    .process(b"\x1b]2;~/Projects\x07")
+                    .unwrap();
+                for (name, x, menu) in [("right", 872, 25.0), ("left", 8, 939.0)] {
+                    decorations.set(WindowDecorations {
+                        mode: WindowDecorationMode::Hybrid,
+                        controls: CompositorControls {
+                            x,
+                            y: 8,
+                            width: 112,
+                            height: 28,
+                        },
+                    });
+                    let size = Size {
+                        width: 1000.0,
+                        height: 680.0,
+                    };
+                    let mut recorder = SceneRecorder::new();
+                    recorder.begin(1000, 680, 1.0, CLEAR, theme.colors);
+                    let scene = Renderer::new().render(state.build(size), size, &mut recorder);
+                    assert_eq!(scene.focus_hit_test(Point { x: menu, y: 22.0 }), Some(0));
+                    assert!(scene.focus_id_at(1).is_some());
+                    assert!(
+                        scene.focus_id_at(2).is_none(),
+                        "a single session has no tab or close-tab button"
+                    );
+                    assert!(scene.hit_test(Point { x: 500.0, y: 22.0 }).is_none());
+                    if let Some(dir) = std::env::var_os("DTERM_SNAPSHOT_DIR") {
+                        let mut raster = Rasterizer::new(1000, 680);
+                        raster.render(&recorder.finish(), &Damage::Full);
+                        raster
+                            .pixmap()
+                            .save_png(
+                                PathBuf::from(dir).join(format!("{appearance}-single-{name}.png")),
+                            )
+                            .unwrap();
+                    }
+                }
+                state.cleanup();
+            });
+        }
+    }
+    #[test]
+    fn custom_shortcuts_reload_without_replacing_sessions_and_indices_select_tabs() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let state = State::new("/tmp".into(), vec!["/bin/cat".into()], tx);
+        state.add();
+        state.add();
+        let id = state.current().unwrap().session.borrow().id;
+        let mut config = Config::default();
+        config
+            .shortcuts
+            .insert("new_tab".into(), "Ctrl+Alt+T".into());
+        state.event(Event::Configuration(Ok(config)));
+        assert_eq!(state.current().unwrap().session.borrow().id, id);
+        let event = |key| KeyEvent {
+            key,
+            pressed: true,
+            synthetic: false,
+        };
+        state.key(
+            event(Key::Character("T".into())),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.tabs.peek().len(), 2);
+        state.key(
+            event(Key::Character("T".into())),
+            Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.tabs.peek().len(), 3);
+        state.key(
+            event(Key::Character("1".into())),
+            Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.active.peek(), 0);
+        state.key(
+            event(Key::Tab),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.active.peek(), 2);
+        state.key(
+            event(Key::Tab),
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.active.peek(), 0);
+        state.event(Event::Configuration(Err("invalid config".into())));
+        assert_eq!(state.error.peek(), Some("invalid config".into()));
+        state.key(
+            event(Key::Character("T".into())),
+            Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.tabs.peek().len(), 4);
+        state.cleanup();
+    }
+
+    #[test]
+    fn tab_strip_reserves_compositor_controls_and_renders_terminal() {
+        for (appearance, theme) in [("light", Theme::light()), ("dark", Theme::dark())] {
+            creamui_reactive::with_context_scope(|| {
+                creamui_reactive::provide_context(ThemeProvider::new(theme));
+                let decorations = Signal::new(WindowDecorations::default());
+                creamui_reactive::provide_context(decorations.clone());
+                let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+                let state = State::new("/tmp".into(), vec!["/bin/cat".into()], tx);
+                state.add();
+                state.current().unwrap().session.borrow_mut().process(b"\x1b]2;~/Projects\x07\x1b[32msammy\x1b[0m \x1b[34m~/Projects\x1b[0m $ cargo build\r\n   \x1b[32mCompiling\x1b[0m dterm v0.1.0\r\n    \x1b[32mFinished\x1b[0m dev profile in 0.42s\r\n\r\n$ ").unwrap();
+                state.add();
+                state.add();
+                state.add();
+                state.active.set(0);
+                for (width, height) in [(1000, 680), (480, 420)] {
+                    for (name, mode, x) in [
+                        ("right", WindowDecorationMode::Hybrid, width - 128),
+                        ("left", WindowDecorationMode::Hybrid, 8),
+                        ("client", WindowDecorationMode::Client, 0),
+                        ("pending", WindowDecorationMode::Pending, 0),
+                    ] {
+                        decorations.set(WindowDecorations {
+                            mode,
+                            controls: CompositorControls {
+                                x,
+                                y: 12,
+                                width: 112,
+                                height: 28,
+                            },
+                        });
+                        let size = Size {
+                            width: width as f32,
+                            height: height as f32,
+                        };
+                        let mut recorder = SceneRecorder::new();
+                        recorder.begin(width as u32, height as u32, 1.0, CLEAR, theme.colors);
+                        let scene = Renderer::new().render(state.build(size), size, &mut recorder);
+                        if mode == WindowDecorationMode::Hybrid {
+                            for px in (x..x + 112).step_by(8) {
+                                assert!(
+                                    scene
+                                        .hit_test(Point {
+                                            x: px as f32,
+                                            y: 26.0
+                                        })
+                                        .is_none(),
+                                    "{name}/{width}/{px}"
+                                );
+                            }
+                        }
+                        let list = recorder.finish();
+                        if let Some(dir) = std::env::var_os("DTERM_SNAPSHOT_DIR") {
+                            let mut raster = Rasterizer::new(width as u32, height as u32);
+                            raster.render(&list, &Damage::Full);
+                            raster
+                                .pixmap()
+                                .save_png(
+                                    PathBuf::from(dir)
+                                        .join(format!("{appearance}-{name}-{width}.png")),
+                                )
+                                .unwrap();
+                        }
+                    }
+                }
+                state.cleanup();
+            });
+        }
+    }
+    #[test]
+    fn closing_tabs_keeps_the_active_session_and_shortcuts_switch_tabs() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let state = State::new("/tmp".into(), vec!["/bin/cat".into()], tx);
+        state.add();
+        state.add();
+        state.add();
+        let id = state.current().unwrap().session.borrow().id;
+        state.close(0);
+        assert_eq!(state.current().unwrap().session.borrow().id, id);
+        state.key(
+            KeyEvent {
+                key: Key::Tab,
+                pressed: true,
+                synthetic: false,
+            },
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.active.peek(), 0);
+        state.close(1);
+        assert_eq!(state.active.peek(), 0);
+        state.cleanup();
+    }
+}
