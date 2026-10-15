@@ -118,7 +118,7 @@ pub fn build(display_name: &str) -> BoxedWidget {
 }
 
 fn open_link(url: &str) {
-    match std::process::Command::new("xdg-open").arg(url).spawn() {
+    match crate::backends::open_url(url).spawn() {
         Ok(mut child) => {
             std::thread::spawn(move || {
                 let _ = child.wait();

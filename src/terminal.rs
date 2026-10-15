@@ -9,6 +9,18 @@ use std::{
 };
 
 pub const SCROLLBACK: usize = 10_000;
+
+/// Working directory for tests that only need a live PTY, on either platform.
+#[cfg(test)]
+pub(crate) fn idle_cwd() -> std::path::PathBuf {
+    crate::backends::idle_cwd()
+}
+
+/// A process that stays open so tests can drive the VT parser themselves.
+#[cfg(test)]
+pub(crate) fn idle_command() -> Vec<String> {
+    crate::backends::idle_command()
+}
 pub enum Event {
     Output(u64, Vec<u8>),
     Exited(u64, String),
@@ -103,15 +115,18 @@ impl Session {
         // An inherited size would override the PTY's negotiated dimensions in some shells.
         cmd.env_remove("LINES");
         cmd.env_remove("COLUMNS");
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .context("couldn't start the terminal process")?;
         let killer = child.clone_killer();
         drop(pair.slave);
         let (input, incoming) = mpsc::sync_channel::<Vec<u8>>(64);
+        let (handshake_tx, handshake_rx) = mpsc::channel::<()>();
+        let mut handshake_tx = Some(handshake_tx);
         thread::spawn(move || {
             while let Ok(bytes) = incoming.recv() {
+                let answered = crate::backends::is_startup_reply(&bytes);
                 if writer
                     .write_all(&bytes)
                     .and_then(|_| writer.flush())
@@ -119,14 +134,59 @@ impl Session {
                 {
                     break;
                 }
+                if answered {
+                    if let Some(done) = handshake_tx.take() {
+                        let _ = done.send(());
+                    }
+                }
             }
         });
+        let reply = input.clone();
+        let (startup_tx, startup_rx) = mpsc::channel::<bool>();
+        let exit_events = events.clone();
+        let child = crate::backends::watch_child(
+            child,
+            Box::new(move |status| {
+                let _ = exit_events.send(Event::Exited(id, status));
+            }),
+        );
         thread::spawn(move || {
             let mut buffer = [0; 16 * 1024];
+            let mut startup = Some(Vec::new());
+            let mut startup_tx = Some(startup_tx);
             loop {
                 match reader.read(&mut buffer) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        if let Some(done) = startup_tx.take() {
+                            let _ = done.send(false);
+                        }
+                        break;
+                    }
                     Ok(n) => {
+                        if let Some(pending) = startup.as_mut() {
+                            pending.extend_from_slice(&buffer[..n]);
+                            match crate::backends::take_startup(pending) {
+                                crate::backends::Startup::NeedMore => continue,
+                                crate::backends::Startup::Ready { reply: answer } => {
+                                    let answered = answer.is_some();
+                                    if let Some(answer) = answer {
+                                        let _ = reply.send(answer);
+                                    }
+                                    let forward = std::mem::take(pending);
+                                    startup = None;
+                                    if let Some(done) = startup_tx.take() {
+                                        let _ = done.send(answered);
+                                    }
+                                    if forward.is_empty() {
+                                        continue;
+                                    }
+                                    if events.send(Event::Output(id, forward)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         if events
                             .send(Event::Output(id, buffer[..n].to_vec()))
                             .is_err()
@@ -136,15 +196,29 @@ impl Session {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     // Linux PTYs return EIO when the slave closes.
-                    Err(_) => break,
+                    Err(_) => {
+                        if let Some(done) = startup_tx.take() {
+                            let _ = done.send(false);
+                        }
+                        break;
+                    }
                 }
             }
-            let status = match child.wait() {
-                Ok(status) => status.to_string(),
-                Err(error) => format!("Process ended: {error}"),
-            };
-            let _ = events.send(Event::Exited(id, status));
+            if let Some(mut child) = child {
+                let status = match child.wait() {
+                    Ok(status) => status.to_string(),
+                    Err(error) => format!("Process ended: {error}"),
+                };
+                let _ = events.send(Event::Exited(id, status));
+            }
         });
+        if crate::backends::waits_for_pty_startup()
+            && startup_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap_or(false)
+        {
+            let _ = handshake_rx.recv_timeout(std::time::Duration::from_secs(2));
+        }
         Ok(Self {
             id,
             parser: vt100::Parser::new_with_callbacks(24, 80, SCROLLBACK, Callbacks::default()),
@@ -211,17 +285,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.input = None;
         if self.exited.is_none() {
-            if let Some(group) = self
-                .master
-                .process_group_leader()
-                .filter(|group| *group > 0)
-            {
-                // SAFETY: openpty/spawn_command creates a separate session. Signal
-                // its foreground job group as a real terminal hangup would.
-                unsafe {
-                    libc::kill(-group, libc::SIGHUP);
-                }
-            }
+            crate::backends::hangup(self.master.as_ref());
             let _ = self.killer.kill();
         }
     }
@@ -245,6 +309,7 @@ mod tests {
         parser.process(b"\x1b[?1049hother\x1b[?1049l");
         assert_eq!(parser.screen().contents(), "hi");
     }
+    #[cfg(unix)]
     #[test]
     fn real_pty_has_correct_size_environment_and_reaps_child() {
         let (tx, rx) = mpsc::sync_channel(128);
@@ -275,5 +340,42 @@ mod tests {
         let text = session.parser.screen().contents();
         assert!(text.contains("32 100"), "{text}");
         assert!(text.contains("xterm-256color:/tmp:hello"), "{text}");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn real_pty_runs_cmd() {
+        let (tx, rx) = mpsc::sync_channel(128);
+        let mut session = Session::spawn(
+            7,
+            &std::env::temp_dir(),
+            &[
+                "cmd.exe".into(),
+                "/d".into(),
+                "/c".into(),
+                "echo hello-from-pty".into(),
+            ],
+            tx,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut exited = false;
+        loop {
+            let text = session.parser.screen().contents();
+            if exited && text.contains("hello-from-pty") {
+                break;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                panic!("timed out waiting for cmd.exe: {text:?}");
+            }
+            match rx.recv_timeout(left).unwrap() {
+                Event::Output(_, bytes) => session.process(&bytes).unwrap(),
+                Event::Exited(_, status) => {
+                    session.finish(status);
+                    exited = true;
+                }
+                Event::Configuration(_) => unreachable!(),
+            }
+        }
     }
 }

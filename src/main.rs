@@ -1,6 +1,7 @@
 mod about;
 mod app;
 mod appearance;
+mod backends;
 mod chrome;
 mod cli;
 mod config;
@@ -41,7 +42,7 @@ fn options(title: &str, width: u32, height: u32) -> WindowOptions {
     }
 }
 fn run_terminal(cwd: std::path::PathBuf, command: Vec<String>) {
-    appearance::ensure_wayland_display();
+    backends::prepare_display();
     let configuration = config::Config::load();
     let (sender, receiver) = mpsc::sync_channel(128);
     let state = app::State::new(cwd, command, sender.clone());
@@ -80,7 +81,7 @@ fn run_terminal(cwd: std::path::PathBuf, command: Vec<String>) {
     cleanup.cleanup();
 }
 fn run_settings() {
-    appearance::ensure_wayland_display();
+    backends::prepare_display();
     let state = settings::State::new();
     let window = state.window.clone();
     let ready = window.clone();

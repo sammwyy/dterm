@@ -4,7 +4,6 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -12,6 +11,7 @@ use std::{
 #[serde(from = "FileConfig")]
 pub struct Config {
     pub shell: String,
+    pub font: String,
     pub island: crate::island::Config,
     pub shortcuts: BTreeMap<String, String>,
 }
@@ -19,6 +19,7 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     shell: Option<String>,
+    font: Option<String>,
     island: crate::island::Config,
     shortcuts: BTreeMap<String, String>,
 }
@@ -28,6 +29,9 @@ impl From<FileConfig> for Config {
         if let Some(shell) = file.shell {
             config.shell = shell;
         }
+        if let Some(font) = file.font {
+            config.font = font.trim().to_string();
+        }
         config.shortcuts.extend(file.shortcuts);
         config.island = file.island;
         config
@@ -36,7 +40,8 @@ impl From<FileConfig> for Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            shell: "bash".into(),
+            shell: default_shell().into(),
+            font: default_font(),
             island: crate::island::Config::default(),
             shortcuts: Action::all()
                 .into_iter()
@@ -100,7 +105,13 @@ impl Config {
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.shell.trim().is_empty() {
-            return Err("Enter a shell executable, such as bash".into());
+            return Err(format!(
+                "Enter a shell executable, such as {}",
+                default_shell()
+            ));
+        }
+        if self.font.trim().is_empty() {
+            return Err("Choose a terminal font".into());
         }
         self.bindings().map(|_| ())
     }
@@ -138,21 +149,33 @@ pub fn paths() -> Vec<PathBuf> {
 pub fn fingerprint() -> Vec<Option<Vec<u8>>> {
     paths().iter().map(|p| fs::read(p).ok()).collect()
 }
+pub fn default_shell() -> &'static str {
+    crate::backends::default_shell()
+}
+pub fn default_font() -> String {
+    crate::backends::default_font()
+}
 fn resolve_shell(shell: &str, search: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
-    for name in [shell, "sh", "bash"] {
+    let mut names = vec![shell];
+    for &fallback in crate::backends::fallback_shells() {
+        if !names.contains(&fallback) {
+            names.push(fallback);
+        }
+    }
+    for name in names {
         let p = Path::new(name);
         let candidates = if p.components().count() > 1 {
-            vec![p.to_owned()]
+            crate::backends::executable_candidates(p)
         } else {
             search
                 .map(std::env::split_paths)
                 .into_iter()
                 .flatten()
-                .map(|d| d.join(p))
+                .flat_map(|dir| crate::backends::executable_candidates(&dir.join(p)))
                 .collect()
         };
-        if let Some(path) = candidates.into_iter().find(|p| {
-            fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        if let Some(path) = candidates.into_iter().find(|path| {
+            fs::metadata(path).is_ok_and(|meta| crate::backends::is_executable_file(&meta))
         }) {
             return if path.is_absolute() {
                 Ok(path)
@@ -163,7 +186,7 @@ fn resolve_shell(shell: &str, search: Option<&std::ffi::OsStr>) -> Result<PathBu
             };
         }
     }
-    Err(format!("Couldn't find {shell:?}, sh or bash in PATH"))
+    Err(crate::backends::shell_missing_message(shell))
 }
 #[cfg(test)]
 mod tests {
@@ -181,10 +204,16 @@ mod tests {
     fn partial_config_merges_defaults_and_rejects_conflicts() {
         let c = Config::parse("shell='zsh'\n[shortcuts]\nnew_tab='Ctrl+Alt+T'\ncopy=''\n").unwrap();
         assert_eq!(c.shell, "zsh");
+        assert_eq!(c.font, Config::default().font);
         assert_eq!(c.shortcuts["new_window"], "Ctrl+Shift+N");
         assert_eq!(c.shortcuts["copy"], "");
         assert!(Config::parse("[shortcuts]\nnew_tab='Ctrl+Shift+N'").is_err());
         assert!(Config::parse("shell=''").is_err());
+        assert!(Config::parse("font=''").is_err());
+        assert_eq!(
+            Config::parse("font='Consolas'").unwrap().font,
+            "Consolas"
+        );
         assert!(Config::parse("[shortcuts]\nunknown='Ctrl+K'").is_err());
     }
     #[test]
@@ -225,8 +254,10 @@ mod tests {
         assert_eq!(Config::load_paths(&[user]).unwrap(), Config::default());
         fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn shell_falls_back_in_order_and_ignores_non_executables() {
+        use std::os::unix::fs::PermissionsExt;
         let root = fixture();
         let path = std::ffi::OsString::from(&root);
         for name in ["sh", "bash", "custom"] {
@@ -244,6 +275,51 @@ mod tests {
         fs::remove_file(root.join("sh")).unwrap();
         assert_eq!(resolve_shell("sh", Some(&path)).unwrap(), root.join("bash"));
         fs::set_permissions(root.join("bash"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(resolve_shell("missing", Some(&path)).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn shell_falls_back_to_windows_executables() {
+        let root = fixture();
+        let path = std::ffi::OsString::from(&root);
+        fs::write(root.join("custom"), "not executable").unwrap();
+        for name in ["powershell.exe", "pwsh.exe", "cmd.exe", "custom.exe"] {
+            fs::write(root.join(name), "").unwrap();
+        }
+        assert_eq!(
+            resolve_shell("custom", Some(&path))
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+            root.join("custom.exe").to_string_lossy().to_ascii_lowercase()
+        );
+        assert_eq!(
+            resolve_shell("missing", Some(&path))
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+            root.join("powershell.exe")
+                .to_string_lossy()
+                .to_ascii_lowercase()
+        );
+        fs::remove_file(root.join("powershell.exe")).unwrap();
+        assert_eq!(
+            resolve_shell("missing", Some(&path))
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+            root.join("pwsh.exe").to_string_lossy().to_ascii_lowercase()
+        );
+        fs::remove_file(root.join("pwsh.exe")).unwrap();
+        assert_eq!(
+            resolve_shell("missing", Some(&path))
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+            root.join("cmd.exe").to_string_lossy().to_ascii_lowercase()
+        );
+        fs::remove_file(root.join("cmd.exe")).unwrap();
         assert!(resolve_shell("missing", Some(&path)).is_err());
         fs::remove_dir_all(root).unwrap();
     }

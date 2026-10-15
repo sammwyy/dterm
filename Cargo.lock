@@ -688,6 +688,7 @@ dependencies = [
  "portable-pty",
  "regex",
  "serde",
+ "swash",
  "toml",
  "vt100",
 ]

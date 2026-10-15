@@ -41,6 +41,7 @@ pub struct State {
     path: PathBuf,
     island_horizontal: SelectController,
     island_vertical: SelectController,
+    font: SelectController,
 }
 impl State {
     pub fn new() -> Self {
@@ -60,6 +61,7 @@ impl State {
             path: crate::config::path(),
             island_horizontal: SelectController::new(1),
             island_vertical: SelectController::new(2),
+            font: SelectController::new(0),
         }
     }
     fn save(&self) {
@@ -208,7 +210,7 @@ impl State {
         view(
             column(24.0),
             vec![
-                heading("General", "Shell and floating controls."),
+                heading("General", "Shell, font and floating controls."),
                 settings_group(
                     "Shell",
                     vec![setting_row(
@@ -219,7 +221,7 @@ impl State {
                             TextInput::new(self.config.get().shell, move |shell| {
                                 state.config.update(|c| c.shell = shell)
                             })
-                            .placeholder("bash")
+                            .placeholder(crate::config::default_shell())
                             .width(160.0)
                             .height(34.0)
                             .font_size(13.0)
@@ -231,9 +233,41 @@ impl State {
                         ),
                     )],
                 ),
+                self.font_settings(),
                 self.island_settings(),
                 self.actions(Page::General),
             ],
+        )
+    }
+    fn font_settings(&self) -> BoxedWidget {
+        let selected = self.config.get().font;
+        let choices = crate::backends::font_choices(&selected);
+        let labels: Vec<&str> = choices.iter().map(String::as_str).collect();
+        let index = labels
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(&selected))
+            .unwrap_or(0);
+        sync_select(&self.font, index);
+        let state = self.clone();
+        let on_choose = choices.clone();
+        settings_group(
+            "Terminal",
+            vec![setting_row(
+                Symbol::Appearance,
+                "Font",
+                "For terminal text.",
+                Box::new(
+                    Select::controlled(&labels, self.font.clone())
+                        .searchable()
+                        .width(220.0)
+                        .height(34.0)
+                        .on_select(move |index| {
+                            if let Some(name) = on_choose.get(index) {
+                                state.config.update(|config| config.font = name.clone());
+                            }
+                        }),
+                ),
+            )],
         )
     }
     fn island_settings(&self) -> BoxedWidget {
@@ -464,6 +498,7 @@ impl State {
                 reset.config.update(|c| {
                     if page == Page::General {
                         c.shell = Config::default().shell;
+                        c.font = Config::default().font;
                         c.island = Config::default().island;
                     } else {
                         c.shortcuts = Config::default().shortcuts
@@ -633,30 +668,32 @@ mod tests {
                     }
                 }
                 state.scroll.set(0.0);
+                // Tall enough that the font row does not push Restore defaults
+                // out of the focus order.
                 let size = Size {
                     width: 720.0,
-                    height: 640.0,
+                    height: 820.0,
                 };
                 let mut recorder = SceneRecorder::new();
-                recorder.begin(720, 640, 1.0, CLEAR, theme.colors);
+                recorder.begin(720, 820, 1.0, CLEAR, theme.colors);
                 let scene = Renderer::new().render(state.build(size), size, &mut recorder);
                 let enter = creamui_core::KeyInput {
                     key: creamui_core::Key::Enter,
                     modifiers: Default::default(),
                 };
                 scene
-                    .on_key_at(6)
+                    .on_key_at(7)
                     .expect("vertical orientation is keyboard accessible")(enter);
                 assert_eq!(
                     state.config.peek().island.orientation,
                     Orientation::Vertical
                 );
                 scene
-                    .on_key_at(4)
+                    .on_key_at(5)
                     .expect("enabled switch is keyboard accessible")(enter);
                 assert!(!state.config.peek().island.enabled);
                 scene
-                    .on_key_at(9)
+                    .on_key_at(10)
                     .expect("restore defaults is keyboard accessible")(enter);
                 assert_eq!(state.config.peek(), Config::default());
             });

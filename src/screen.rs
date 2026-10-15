@@ -7,37 +7,26 @@ use std::{cell::RefCell, rc::Rc};
 pub const FONT: &str = "Dterm Mono, DejaVu Sans Mono, Liberation Mono";
 pub const PADDING: f32 = 14.0;
 const TOP_PADDING: f32 = 6.0;
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Metrics {
     pub width: f32,
     pub height: f32,
     pub font_size: f32,
 }
 impl Metrics {
-    pub fn load() -> Self {
+    pub fn load(family: &str) -> Self {
         use creamui_fonts::{FontWeight, LayoutSettings};
-        for (weight, pattern) in [
-            (FontWeight::Regular, "monospace"),
-            (FontWeight::Bold, "monospace:style=Bold"),
-        ] {
-            if let Ok(output) = std::process::Command::new("fc-match")
-                .args(["-f", "%{file}", pattern])
-                .output()
-            {
-                if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout);
-                    let _ = creamui_fonts::register_file("Dterm Mono", weight, path.trim());
-                }
-            }
-        }
+        crate::backends::install_terminal_font(family);
         let font_size = 14.0;
         let face = creamui_fonts::resolve(FONT, FontWeight::Regular);
         let shaped =
             creamui_fonts::cached_layout(&face, "M", font_size, &LayoutSettings::default());
         let width = shaped.chars.first().map(|c| c.advance).unwrap_or(8.5);
+        // The underline is drawn on the bottom 3px of the cell.
+        let height = (face.line_metrics(font_size).line_height + 3.0).ceil();
         Self {
             width,
-            height: (face.line_metrics(font_size).line_height + 3.0).ceil(),
+            height,
             font_size,
         }
     }
@@ -364,7 +353,7 @@ mod tests {
             creamui_reactive::provide_context(ThemeProvider::new(theme));
             let (tx, _rx) = std::sync::mpsc::sync_channel(128);
             let mut session =
-                Session::spawn(1, std::path::Path::new("/tmp"), &["/bin/cat".into()], tx).unwrap();
+                Session::spawn(1, &crate::terminal::idle_cwd(), &crate::terminal::idle_command(), tx).unwrap();
             session.resize(8, 12).unwrap();
             session.process(b"\x1b[?25l\x1b[44m            ").unwrap();
             session.process(b"\x1b[2;1H").unwrap();
@@ -514,7 +503,7 @@ mod tests {
             creamui_reactive::provide_context(ThemeProvider::new(theme));
             let (tx, _rx) = std::sync::mpsc::sync_channel(128);
             let mut session =
-                Session::spawn(1, std::path::Path::new("/tmp"), &["/bin/cat".into()], tx).unwrap();
+                Session::spawn(1, &crate::terminal::idle_cwd(), &crate::terminal::idle_command(), tx).unwrap();
             session.resize(3, 12).unwrap();
             session.process(b"\x1b[?25l\x1b[44m            ").unwrap();
             let screen = TerminalScreen {
