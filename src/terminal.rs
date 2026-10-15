@@ -64,6 +64,8 @@ pub struct Session {
     pub id: u64,
     pub parser: vt100::Parser<Callbacks>,
     pub exited: Option<String>,
+    pub search: crate::search::Search,
+    pub control_mode: Option<crate::island::Mode>,
     master: Box<dyn MasterPty + Send>,
     input: Option<SyncSender<Vec<u8>>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -147,6 +149,8 @@ impl Session {
             id,
             parser: vt100::Parser::new_with_callbacks(24, 80, SCROLLBACK, Callbacks::default()),
             exited: None,
+            search: crate::search::Search::default(),
+            control_mode: None,
             master: pair.master,
             input: Some(input),
             killer,
@@ -154,6 +158,7 @@ impl Session {
     }
     pub fn process(&mut self, bytes: &[u8]) -> Result<()> {
         self.parser.process(bytes);
+        self.refresh_mode();
         let replies = std::mem::take(&mut self.parser.callbacks_mut().replies);
         if !replies.is_empty() {
             self.write(replies)?;
@@ -177,12 +182,29 @@ impl Session {
                 pixel_height: 0,
             })?;
             self.parser.screen_mut().set_size(rows, cols);
+            self.refresh_mode();
         }
         Ok(())
     }
     pub fn finish(&mut self, status: String) {
         self.exited = Some(status);
         self.input = None;
+    }
+    pub fn set_mode(&mut self, mode: Option<crate::island::Mode>) {
+        self.control_mode = mode;
+        match mode {
+            Some(crate::island::Mode::Search) => {
+                self.refresh_mode();
+                self.search.reveal(self.parser.screen_mut());
+            }
+            None => self.search.clear(),
+        }
+    }
+    fn refresh_mode(&mut self) {
+        match self.control_mode {
+            Some(crate::island::Mode::Search) => self.search.refresh(self.parser.screen()),
+            None => {}
+        }
     }
 }
 impl Drop for Session {

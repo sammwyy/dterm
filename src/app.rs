@@ -1,6 +1,7 @@
 use crate::{
     chrome,
     config::Config,
+    island::{self, Mode, Orientation},
     screen::{Metrics, Selection, TerminalScreen},
     shortcuts::{Action, Binding},
     terminal::{Event, Session},
@@ -8,15 +9,17 @@ use crate::{
 };
 use creamui_core::{
     layout::{Dimension, Style},
-    BoxedWidget, Size, StateStyle, Styled,
+    BoxedWidget, Rect, Size, StateStyle, Styled, Widget,
 };
 use creamui_reactive::Signal;
 use creamui_render::{
-    platform::{KeyEvent, Modifiers},
+    platform::{Key, KeyEvent, Modifiers},
     AppHandle, WindowHandle,
 };
 use creamui_theme::use_theme;
-use creamui_widgets::{CUIWindowDragArea, Icon, RawButton, RawView, Symbol, Text};
+use creamui_widgets::{
+    CUIWindowDragArea, Icon, RawButton, RawTextInput, RawView, ScrollController, Symbol, Text,
+};
 use std::{
     cell::RefCell,
     path::PathBuf,
@@ -31,6 +34,7 @@ use std::{
 struct Tab {
     session: Rc<RefCell<Session>>,
     selection: Signal<Option<Selection>>,
+    island_scroll: ScrollController,
 }
 #[derive(Clone)]
 pub struct State {
@@ -89,6 +93,7 @@ impl State {
                     tabs.push(Tab {
                         session: Rc::new(RefCell::new(session)),
                         selection: Signal::new(None),
+                        island_scroll: ScrollController::new(0.0),
                     })
                 });
                 self.active.set(index);
@@ -147,6 +152,23 @@ impl State {
     }
     fn paste_text(&self, text: &str) {
         if let Some(tab) = self.current() {
+            if tab.session.borrow().control_mode == Some(Mode::Search) {
+                self.edit_search(
+                    |search| {
+                        let range = search.selection.range();
+                        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                        search.query.replace_range(range.clone(), &text);
+                        search.cursor = range.start + text.len();
+                        search.selection = creamui_widgets::TextSelection {
+                            anchor: search.cursor,
+                            focus: search.cursor,
+                        };
+                        search.current = None;
+                    },
+                    true,
+                );
+                return;
+            }
             let result = {
                 let mut session = tab.session.borrow_mut();
                 let bracketed = session.parser.screen().bracketed_paste();
@@ -191,6 +213,59 @@ impl State {
         if !event.pressed {
             return true;
         }
+        if let Some(mode) = self.current().and_then(|t| t.session.borrow().control_mode) {
+            if event.key == Key::Escape {
+                self.close_mode();
+                return true;
+            }
+            match mode {
+                Mode::Search => match event.key {
+                    Key::Enter | Key::Up | Key::Down => {
+                        self.navigate_search(
+                            event.key == Key::Up || event.key == Key::Enter && m.shift,
+                        );
+                    }
+                    _ => {
+                        let action = self
+                            .bindings
+                            .borrow()
+                            .iter()
+                            .find(|(_, binding)| binding.matches(&event.key, m))
+                            .map(|(action, _)| *action);
+                        if action == Some(Action::Search) {
+                            return true;
+                        }
+                        if action == Some(Action::Paste)
+                            || m.ctrl
+                                && matches!(&event.key, Key::Character(s) if s.eq_ignore_ascii_case("v"))
+                        {
+                            self.paste();
+                            return true;
+                        }
+                        if let Some(action) = action.filter(|a| *a != Action::Copy) {
+                            self.dispatch(action);
+                            return true;
+                        }
+                        if let Some(key) = search_key(&event.key) {
+                            if let Some(editor) = self.search_editor() {
+                                if let Some(handler) = editor.on_key() {
+                                    handler(creamui_core::KeyInput {
+                                        key,
+                                        modifiers: creamui_core::Modifiers {
+                                            ctrl: m.ctrl,
+                                            shift: m.shift,
+                                            alt: m.alt,
+                                            logo: m.logo,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+            return true;
+        }
         let action = self
             .bindings
             .borrow()
@@ -222,8 +297,15 @@ impl State {
     pub fn configure(&self, config: Config) {
         match config.bindings() {
             Ok(bindings) => {
-                *self.bindings.borrow_mut() = bindings;
-                self.config.set(config);
+                creamui_reactive::batch(|| {
+                    if !config.island.enabled {
+                        for tab in self.tabs.peek() {
+                            tab.session.borrow_mut().set_mode(None);
+                        }
+                    }
+                    *self.bindings.borrow_mut() = bindings;
+                    self.config.set(config);
+                });
             }
             Err(error) => self.show_error(error),
         }
@@ -245,6 +327,7 @@ impl State {
             }
             Action::Copy => self.copy(),
             Action::Paste => self.paste(),
+            Action::Search => self.activate_mode(Mode::Search),
             Action::Settings => open_settings(),
             Action::ScrollUp | Action::ScrollDown => {
                 if let Some(tab) = self.current() {
@@ -265,6 +348,197 @@ impl State {
                 }
             }
         }
+    }
+    fn edit_search(&self, edit: impl FnOnce(&mut crate::search::Search), refresh: bool) {
+        if let Some(tab) = self.current() {
+            {
+                let mut session = tab.session.borrow_mut();
+                let Session { search, parser, .. } = &mut *session;
+                edit(search);
+                if refresh {
+                    search.refresh(parser.screen());
+                    search.reveal(parser.screen_mut());
+                }
+            }
+            self.revision.update(|v| *v = v.wrapping_add(1));
+        }
+    }
+    fn activate_mode(&self, mode: Mode) {
+        if !self.config.peek().island.enabled {
+            return;
+        }
+        if let Some(tab) = self.current() {
+            tab.session.borrow_mut().set_mode(Some(mode));
+            creamui_reactive::batch(|| {
+                tab.island_scroll.set(0.0);
+                self.revision.update(|v| *v = v.wrapping_add(1));
+            });
+        }
+    }
+    fn close_mode(&self) {
+        if let Some(tab) = self.current() {
+            tab.session.borrow_mut().set_mode(None);
+            self.revision.update(|v| *v = v.wrapping_add(1));
+        }
+    }
+    fn navigate_search(&self, previous: bool) {
+        if let Some(tab) = self.current() {
+            {
+                let mut session = tab.session.borrow_mut();
+                let Session { search, parser, .. } = &mut *session;
+                search.navigate(parser.screen_mut(), previous);
+            }
+            self.revision.update(|v| *v = v.wrapping_add(1));
+        }
+    }
+    // Native key callbacks run outside the window's context scope. Keep
+    // construction of the editing handler independent of rendering hooks.
+    fn search_editor(&self) -> Option<RawTextInput> {
+        let tab = self.current()?;
+        let session = tab.session.borrow();
+        let search = &session.search;
+        let change = self.clone();
+        let cursor = self.clone();
+        let selection = self.clone();
+        Some(
+            RawTextInput::new(
+                pad(
+                    Style {
+                        flex_grow: 1.0,
+                        flex_shrink: 1.0,
+                        flex_basis: Dimension::Length(0.0),
+                        ..fixed(180.0, 34.0)
+                    },
+                    10.0,
+                    0.0,
+                ),
+                search.query.clone(),
+                14.0,
+                CLEAR,
+                move |value| {
+                    change.edit_search(
+                        |search| {
+                            search.query = value;
+                            search.current = None;
+                        },
+                        true,
+                    )
+                },
+            )
+            .cursor(search.cursor, move |value| {
+                cursor.edit_search(|s| s.cursor = value, false)
+            })
+            .selection(search.selection, move |value| {
+                selection.edit_search(|s| s.selection = value, false)
+            }),
+        )
+    }
+    fn search_input(&self) -> Option<crate::search::SearchInput> {
+        let editor = self.search_editor()?;
+        let theme = use_theme();
+        Some(crate::search::SearchInput(
+            editor
+                .color(theme.colors.text_primary)
+                .placeholder("Search scrollback…", theme.colors.text_secondary)
+                .background(theme.colors.surface)
+                .corner_radius(6.0)
+                .border(theme.colors.accent, 1.0)
+                .selection_background(theme.colors.accent.mix(theme.colors.surface, 0.5)),
+        ))
+    }
+    fn search_content(
+        &self,
+        orientation: Orientation,
+        available_width: f32,
+    ) -> Option<(BoxedWidget, Size)> {
+        let editor = self.search_input()?;
+        let tab = self.current()?;
+        let session = tab.session.borrow();
+        let search = &session.search;
+        let label = if search.error.is_some() {
+            "Invalid regex".into()
+        } else if search.query.is_empty() {
+            "".into()
+        } else {
+            format!(
+                "{}/{}",
+                search.current.map_or(0, |i| i + 1),
+                search.matches.len()
+            )
+        };
+        let regex = self.clone();
+        let up = self.clone();
+        let down = self.clone();
+        let close = self.clone();
+        let vertical = orientation == Orientation::Vertical;
+        let input_width = (available_width - 32.0).clamp(1.0, 224.0);
+        let control_width = if vertical { input_width } else { 30.0 };
+        let preferred = if vertical {
+            Size {
+                width: 240.0,
+                height: 238.0,
+            }
+        } else {
+            Size {
+                width: 560.0,
+                height: 50.0,
+            }
+        };
+        let mut editor = editor;
+        if vertical {
+            editor.0 = editor.0.layout(pad(fixed(input_width, 34.0), 10.0, 0.0));
+        }
+        let content = view(
+            Style {
+                size: creamui_core::layout::Size {
+                    width: Dimension::Percent(1.0),
+                    height: Dimension::Auto,
+                },
+                ..if vertical { column(6.0) } else { row(6.0) }
+            },
+            vec![
+                Box::new(editor),
+                Box::new(Text::secondary(label).font_size(12.0).layout(fixed(
+                    if vertical { input_width } else { 82.0 },
+                    if vertical { 22.0 } else { 34.0 },
+                ))),
+                button(
+                    if search.regex { ".* ✓" } else { ".*" },
+                    if vertical { input_width } else { 48.0 },
+                    move || {
+                        regex.edit_search(
+                            |s| {
+                                s.regex = !s.regex;
+                                s.current = None;
+                            },
+                            true,
+                        )
+                    },
+                ),
+                button("↑", control_width, move || up.navigate_search(true)),
+                button("↓", control_width, move || down.navigate_search(false)),
+                button("×", control_width, move || close.close_mode()),
+            ],
+        );
+        Some((content, preferred))
+    }
+    fn control_island(&self, area: Rect) -> Option<BoxedWidget> {
+        let config = self.config.get().island;
+        if !config.enabled {
+            return None;
+        }
+        let tab = self.current()?;
+        let mode = tab.session.borrow().control_mode?;
+        let (content, preferred) = match mode {
+            Mode::Search => self.search_content(config.orientation, area.width)?,
+        };
+        Some(island::surface(
+            &config,
+            area,
+            preferred,
+            content,
+            tab.island_scroll.clone(),
+        ))
     }
     fn new_window(&self) {
         let result = std::env::current_exe().and_then(|exe| {
@@ -393,6 +667,14 @@ impl State {
                     }),
                 ]),
             ));
+        }
+        if let Some(bar) = self.control_island(Rect {
+            x: 0.0,
+            y: chrome::HEADER,
+            width: size.width,
+            height: screen_height,
+        }) {
+            children.push(bar);
         }
         Box::new(
             RawView::new(Style {
@@ -583,6 +865,21 @@ impl State {
     }
 }
 
+fn search_key(key: &Key) -> Option<creamui_core::Key> {
+    use creamui_core::Key as K;
+    Some(match key {
+        Key::Character(s) => K::Char(s.chars().next()?),
+        Key::Space => K::Char(' '),
+        Key::Backspace => K::Backspace,
+        Key::Delete => K::Delete,
+        Key::Left => K::Left,
+        Key::Right => K::Right,
+        Key::Home => K::Home,
+        Key::End => K::End,
+        _ => return None,
+    })
+}
+
 pub fn open_settings() {
     match std::env::current_exe()
         .and_then(|exe| std::process::Command::new(exe).arg("--settings").spawn())
@@ -649,6 +946,314 @@ mod tests {
         WindowDecorations,
     };
     use creamui_theme::{Theme, ThemeProvider};
+    #[test]
+    fn island_modes_reposition_live_and_all_controls_remain_clickable() {
+        use crate::island::{Horizontal, Vertical};
+        creamui_reactive::with_context_scope(|| {
+            let theme = Theme::dark();
+            creamui_reactive::provide_context(ThemeProvider::new(theme));
+            creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
+            let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+            let state = State::new("/tmp".into(), vec!["/bin/cat".into()], tx);
+            state.add();
+            let tab = state.current().unwrap();
+            tab.session
+                .borrow_mut()
+                .process(b"entry 1\r\nentry 2\r\nentry 3")
+                .unwrap();
+            for orientation in [Orientation::Horizontal, Orientation::Vertical] {
+                for horizontal in [Horizontal::Left, Horizontal::Center, Horizontal::Right] {
+                    for vertical in [Vertical::Top, Vertical::Center, Vertical::Bottom] {
+                        let mut config = state.config.peek();
+                        config.island = island::Config {
+                            enabled: true,
+                            orientation,
+                            horizontal,
+                            vertical,
+                        };
+                        state.configure(config.clone());
+                        state.activate_mode(Mode::Search);
+                        state.edit_search(
+                            |s| {
+                                s.query = "entry [0-9]".into();
+                                s.regex = false;
+                            },
+                            true,
+                        );
+                        // Status messages reduce the usable area and must remain clear.
+                        state.show_error("Example status".into());
+                        let size = Size {
+                            width: 640.0,
+                            height: 420.0,
+                        };
+                        let mut recorder = SceneRecorder::new();
+                        recorder.begin(640, 420, 1.0, CLEAR, theme.colors);
+                        let scene = Renderer::new().render(state.build(size), size, &mut recorder);
+                        let preferred = if orientation == Orientation::Horizontal {
+                            Size {
+                                width: 560.0,
+                                height: 50.0,
+                            }
+                        } else {
+                            Size {
+                                width: 240.0,
+                                height: 238.0,
+                            }
+                        };
+                        let bounds = config.island.bounds(
+                            Rect {
+                                x: 0.0,
+                                y: chrome::HEADER,
+                                width: size.width,
+                                height: size.height - chrome::HEADER - 36.0,
+                            },
+                            preferred,
+                        );
+                        let regex = if orientation == Orientation::Horizontal {
+                            Point {
+                                x: bounds.x + bounds.width - 140.0,
+                                y: bounds.y + 25.0,
+                            }
+                        } else {
+                            Point {
+                                x: bounds.x + bounds.width / 2.0,
+                                y: bounds.y + 93.0,
+                            }
+                        };
+                        scene
+                            .hit_test(regex)
+                            .expect("regex control at selected anchor")();
+                        assert!(tab.session.borrow().search.regex);
+                        assert_eq!(tab.session.borrow().search.matches.len(), 3);
+                        let close = if orientation == Orientation::Horizontal {
+                            Point {
+                                x: bounds.x + bounds.width - 23.0,
+                                y: bounds.y + 25.0,
+                            }
+                        } else {
+                            Point {
+                                x: bounds.x + bounds.width / 2.0,
+                                y: bounds.y + bounds.height - 25.0,
+                            }
+                        };
+                        if let Some(dir) = std::env::var_os("DTERM_SNAPSHOT_DIR") {
+                            let mut raster = Rasterizer::new(640, 420);
+                            raster.render(&recorder.finish(), &Damage::Full);
+                            raster
+                                .pixmap()
+                                .save_png(PathBuf::from(dir).join(format!(
+                                    "island-{orientation:?}-{horizontal:?}-{vertical:?}.png"
+                                )))
+                                .unwrap();
+                        }
+                        scene
+                            .hit_test(close)
+                            .expect("close control at selected anchor")();
+                        assert_eq!(tab.session.borrow().control_mode, None);
+                        assert!(tab.session.borrow().search.matches.is_empty());
+                    }
+                }
+            }
+            state.cleanup();
+        });
+    }
+
+    #[test]
+    fn disabling_island_closes_modes_in_all_tabs_and_blocks_activation() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let state = State::new("/tmp".into(), vec!["/bin/cat".into()], tx);
+        for _ in 0..2 {
+            state.add();
+            state.dispatch(Action::Search);
+            state.paste_text("query");
+        }
+        let mut config = state.config.peek();
+        config.island.enabled = false;
+        state.configure(config.clone());
+        for tab in state.tabs.peek() {
+            let session = tab.session.borrow();
+            assert_eq!(session.control_mode, None);
+            assert!(session.search.matches.is_empty());
+            assert_eq!(session.search.query, "query");
+        }
+        state.dispatch(Action::Search);
+        assert_eq!(state.current().unwrap().session.borrow().control_mode, None);
+        config.island.enabled = true;
+        state.configure(config);
+        state.dispatch(Action::Search);
+        assert_eq!(
+            state.current().unwrap().session.borrow().control_mode,
+            Some(Mode::Search)
+        );
+        state.cleanup();
+    }
+
+    #[test]
+    fn native_search_keys_work_outside_the_window_context() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let state = State::new("/tmp".into(), vec!["/bin/cat".into()], tx);
+        state.add();
+        let build = state.clone();
+        let effect = creamui_reactive::with_context_scope(|| {
+            creamui_reactive::provide_context(ThemeProvider::new(Theme::dark()));
+            creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
+            creamui_reactive::create_effect(move || {
+                let _ = build.build(Size {
+                    width: 640.0,
+                    height: 420.0,
+                });
+            })
+        });
+        assert!(!creamui_reactive::in_context_scope());
+        let tab = state.current().unwrap();
+        tab.session
+            .borrow_mut()
+            .process("café\r\ncafé".as_bytes())
+            .unwrap();
+        let key = |key, modifiers| {
+            state.key(
+                KeyEvent {
+                    key,
+                    pressed: true,
+                    synthetic: false,
+                },
+                modifiers,
+            )
+        };
+        key(
+            Key::Character("F".into()),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        for ch in "café".chars() {
+            key(Key::Character(ch.to_string()), Modifiers::default());
+        }
+        assert_eq!(tab.session.borrow().search.query, "café");
+        assert_eq!(tab.session.borrow().search.matches.len(), 2);
+        key(Key::Enter, Modifiers::default());
+        assert_eq!(tab.session.borrow().search.current, Some(0));
+        key(Key::Left, Modifiers::default());
+        key(Key::Delete, Modifiers::default());
+        assert_eq!(tab.session.borrow().search.query, "caf");
+        key(Key::Backspace, Modifiers::default());
+        assert_eq!(tab.session.borrow().search.query, "ca");
+        key(
+            Key::Character("a".into()),
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        state.paste_text("café");
+        assert_eq!(tab.session.borrow().search.query, "café");
+        key(Key::Escape, Modifiers::default());
+        assert_eq!(tab.session.borrow().control_mode, None);
+        drop(effect);
+        state.cleanup();
+    }
+
+    #[test]
+    fn search_shortcut_editor_navigation_and_tab_state_survive_reactive_redraws() {
+        creamui_reactive::with_context_scope(|| {
+            let theme = Theme::dark();
+            creamui_reactive::provide_context(ThemeProvider::new(theme));
+            creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
+            let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+            let state = State::new("/tmp".into(), vec!["/bin/cat".into()], tx);
+            state.configure(Config::parse("[shortcuts]\nsearch = 'F6'").unwrap());
+            state.add();
+            let tab = state.current().unwrap();
+            let build = state.clone();
+            let effect = creamui_reactive::create_effect(move || {
+                let _ = build.build(Size {
+                    width: 640.0,
+                    height: 420.0,
+                });
+            });
+            for i in 0..50 {
+                tab.session
+                    .borrow_mut()
+                    .process(format!("entry {i}\r\n").as_bytes())
+                    .unwrap();
+            }
+            let key = |key, modifiers| {
+                state.key(
+                    KeyEvent {
+                        key,
+                        pressed: true,
+                        synthetic: false,
+                    },
+                    modifiers,
+                )
+            };
+            key(Key::F6, Modifiers::default());
+            for ch in "entry".chars() {
+                key(Key::Character(ch.to_string()), Modifiers::default());
+            }
+            assert_eq!(tab.session.borrow().search.query, "entry");
+            assert_eq!(tab.session.borrow().search.matches.len(), 50);
+            key(Key::Enter, Modifiers::default());
+            assert_eq!(tab.session.borrow().search.current, Some(0));
+            assert!(tab.session.borrow().parser.screen().scrollback() > 0);
+            key(Key::Up, Modifiers::default());
+            assert_eq!(tab.session.borrow().search.current, Some(49));
+            key(
+                Key::Character("a".into()),
+                Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            );
+            state.paste_text("entry 4");
+            assert_eq!(tab.session.borrow().search.query, "entry 4");
+            assert_eq!(tab.session.borrow().search.matches.len(), 11);
+
+            // New output updates matches while the editor stays open.
+            let id = tab.session.borrow().id;
+            state.event(Event::Output(id, b"entry 400\r\n".to_vec()));
+            assert_eq!(tab.session.borrow().search.matches.len(), 12);
+
+            for (width, height) in [(640, 420), (360, 280)] {
+                let size = Size {
+                    width: width as f32,
+                    height: height as f32,
+                };
+                let mut recorder = SceneRecorder::new();
+                recorder.begin(width, height, 1.0, CLEAR, theme.colors);
+                let scene = Renderer::new().render(state.build(size), size, &mut recorder);
+                if let Some(dir) = std::env::var_os("DTERM_SNAPSHOT_DIR") {
+                    let mut raster = Rasterizer::new(width, height);
+                    raster.render(&recorder.finish(), &Damage::Full);
+                    raster
+                        .pixmap()
+                        .save_png(PathBuf::from(dir).join(format!("search-{width}.png")))
+                        .unwrap();
+                }
+                assert!(scene
+                    .hit_test(Point {
+                        x: width as f32 / 2.0 + ((width as f32 - 16.0).min(560.0)) / 2.0 - 24.0,
+                        y: height as f32 - 30.0,
+                    })
+                    .is_some());
+            }
+            state.dispatch(Action::NewTab);
+            assert_eq!(state.current().unwrap().session.borrow().control_mode, None);
+            state.dispatch(Action::PreviousTab);
+            assert_eq!(
+                state.current().unwrap().session.borrow().control_mode,
+                Some(Mode::Search)
+            );
+            key(Key::Escape, Modifiers::default());
+            assert_eq!(tab.session.borrow().control_mode, None);
+            assert_eq!(tab.session.borrow().search.query, "entry 4");
+            drop(effect);
+            state.cleanup();
+        });
+    }
+
     #[test]
     fn terminal_input_and_scrolling_can_trigger_an_immediate_reactive_redraw() {
         creamui_reactive::with_context_scope(|| {

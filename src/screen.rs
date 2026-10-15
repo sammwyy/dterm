@@ -167,6 +167,11 @@ impl Widget for TerminalScreen {
                         .map(|cell| cell_colors(cell, selected(row, col), theme.colors).1)
                         .unwrap_or(CLEAR)
                 };
+                let background = |col| match session.search.highlight(screen, row, col) {
+                    Some(true) => theme.colors.accent,
+                    Some(false) => theme.colors.surface.mix(theme.colors.accent, 0.35),
+                    None => background(col),
+                };
                 let bg = background(start);
                 let mut end = start + 1;
                 while end < cols && background(end) == bg {
@@ -186,7 +191,10 @@ impl Widget for TerminalScreen {
                 if cell.is_wide_continuation() {
                     continue;
                 }
-                let (fg, _) = cell_colors(cell, selected(row, col), theme.colors);
+                let (mut fg, _) = cell_colors(cell, selected(row, col), theme.colors);
+                if session.search.highlight(screen, row, col) == Some(true) {
+                    fg = theme.colors.surface;
+                }
                 let span = if cell.is_wide() { 2 } else { 1 };
                 let cell_rect = m.cell_rect(rect, row, col, (col + span).min(cols), scale);
                 if cell.has_contents()

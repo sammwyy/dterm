@@ -1,6 +1,7 @@
 use crate::{
     chrome,
     config::Config,
+    island::{Horizontal, Orientation, Vertical},
     shortcuts::{Action, Binding},
     ui::*,
 };
@@ -16,7 +17,8 @@ use creamui_render::{
 use creamui_theme::use_theme;
 use creamui_widgets::{
     Button, ButtonSize, ButtonState, ButtonVariant, CUIWindowDragArea, Icon, RawButton,
-    RawScrollView, RawView, ScrollController, Symbol, Tab, TabColors, Tabs, Text, TextInput,
+    RawScrollView, RawView, ScrollController, SegmentedControl, Select, SelectController, Switch,
+    Symbol, Tab, TabColors, Tabs, Text, TextInput,
 };
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
@@ -37,6 +39,8 @@ pub struct State {
     capturing: Signal<Option<Action>>,
     message: Signal<Option<String>>,
     path: PathBuf,
+    island_horizontal: SelectController,
+    island_vertical: SelectController,
 }
 impl State {
     pub fn new() -> Self {
@@ -54,6 +58,8 @@ impl State {
             capturing: Signal::new(None),
             message: Signal::new(message),
             path: crate::config::path(),
+            island_horizontal: SelectController::new(1),
+            island_vertical: SelectController::new(2),
         }
     }
     fn save(&self) {
@@ -198,16 +204,132 @@ impl State {
 
     fn general(&self) -> BoxedWidget {
         let state = self.clone();
-        view(column(22.0),vec![
-            heading("General","Choose the shell for new terminal sessions."),
-            Box::new(RawView::new(pad(column(12.0),16.0,16.0)).background(use_theme().colors.surface_elevated).corner_radius(14.0).outline(use_theme().colors.border,1.0)
-                .with_children(vec![
-                    Box::new(Text::new("Default shell").font_size(13.0).bold(true)),
-                    Box::new(TextInput::new(self.config.get().shell,move|shell|state.config.update(|c|c.shell=shell)).placeholder("bash")),
-                    Box::new(Text::secondary("If the executable is unavailable, Terminal tries sh, then bash.").font_size(12.0)),
-                ])),
-            self.actions(Page::General),
-        ])
+        let theme = use_theme();
+        view(
+            column(24.0),
+            vec![
+                heading("General", "Shell and floating controls."),
+                settings_group(
+                    "Shell",
+                    vec![setting_row(
+                        Symbol::Keyboard,
+                        "Default shell",
+                        "For new terminal sessions.",
+                        Box::new(
+                            TextInput::new(self.config.get().shell, move |shell| {
+                                state.config.update(|c| c.shell = shell)
+                            })
+                            .placeholder("bash")
+                            .width(160.0)
+                            .height(34.0)
+                            .font_size(13.0)
+                            .background(
+                                theme.colors.surface.mix(theme.colors.surface_elevated, 0.5),
+                            )
+                            .corner_radius(10.0)
+                            .border(theme.colors.border, 1.0),
+                        ),
+                    )],
+                ),
+                self.island_settings(),
+                self.actions(Page::General),
+            ],
+        )
+    }
+    fn island_settings(&self) -> BoxedWidget {
+        let config = self.config.get().island;
+        let enabled = self.clone();
+        let orientation = self.clone();
+        let horizontal = self.clone();
+        let vertical = self.clone();
+        let horizontal_values = [Horizontal::Left, Horizontal::Center, Horizontal::Right];
+        let vertical_values = [Vertical::Top, Vertical::Center, Vertical::Bottom];
+        sync_select(
+            &self.island_horizontal,
+            horizontal_values
+                .iter()
+                .position(|v| *v == config.horizontal)
+                .unwrap(),
+        );
+        sync_select(
+            &self.island_vertical,
+            vertical_values
+                .iter()
+                .position(|v| *v == config.vertical)
+                .unwrap(),
+        );
+        settings_group(
+            "Control island",
+            vec![
+                setting_row(
+                    Symbol::Controls,
+                    "Enabled",
+                    "Floating search controls.",
+                    Box::new(Switch::new(config.enabled, move || {
+                        enabled
+                            .config
+                            .update(|c| c.island.enabled = !c.island.enabled)
+                    })),
+                ),
+                setting_row(
+                    Symbol::Grid,
+                    "Orientation",
+                    "",
+                    Box::new(
+                        SegmentedControl::new(
+                            usize::from(config.orientation == Orientation::Vertical),
+                            move |index| {
+                                orientation.config.update(|c| {
+                                    c.island.orientation = if index == 0 {
+                                        Orientation::Horizontal
+                                    } else {
+                                        Orientation::Vertical
+                                    }
+                                })
+                            },
+                        )
+                        .option("Horizontal")
+                        .option("Vertical"),
+                    ),
+                ),
+                setting_row(
+                    Symbol::Sliders,
+                    "Horizontal position",
+                    "",
+                    Box::new(
+                        Select::controlled(
+                            &["Left", "Center", "Right"],
+                            self.island_horizontal.clone(),
+                        )
+                        .width(160.0)
+                        .height(34.0)
+                        .on_select(move |index| {
+                            horizontal
+                                .config
+                                .update(|c| c.island.horizontal = horizontal_values[index])
+                        }),
+                    ),
+                ),
+                setting_row(
+                    Symbol::Display,
+                    "Vertical position",
+                    "",
+                    Box::new(
+                        Select::controlled(
+                            &["Top", "Center", "Bottom"],
+                            self.island_vertical.clone(),
+                        )
+                        .width(160.0)
+                        .height(34.0)
+                        .on_select(move |index| {
+                            vertical
+                                .config
+                                .update(|c| c.island.vertical = vertical_values[index])
+                        }),
+                    ),
+                ),
+            ],
+        )
     }
     fn shortcuts(&self) -> BoxedWidget {
         let all = Action::all();
@@ -341,7 +463,8 @@ impl State {
                 reset.message.set(None);
                 reset.config.update(|c| {
                     if page == Page::General {
-                        c.shell = Config::default().shell
+                        c.shell = Config::default().shell;
+                        c.island = Config::default().island;
                     } else {
                         c.shortcuts = Config::default().shortcuts
                     }
@@ -370,6 +493,100 @@ impl State {
         view(column(12.0), children)
     }
 }
+fn sync_select(controller: &SelectController, selected: usize) {
+    if !controller.peek_open() && controller.peek_selected() != selected {
+        controller.select(selected);
+    }
+}
+
+// Follow Coconut Settings' grouped, label-left/control-right form rows.
+fn settings_group(label: &str, rows: Vec<BoxedWidget>) -> BoxedWidget {
+    let theme = use_theme();
+    let mut children = Vec::new();
+    for item in rows {
+        if !children.is_empty() {
+            children.push(Box::new(
+                RawView::new(Style {
+                    size: creamui_core::layout::Size {
+                        width: Dimension::Percent(1.0),
+                        height: Dimension::Length(1.0),
+                    },
+                    flex_shrink: 0.0,
+                    ..Default::default()
+                })
+                .background(theme.colors.border),
+            ) as BoxedWidget);
+        }
+        children.push(item);
+    }
+    view(
+        column(8.0),
+        vec![
+            Box::new(
+                Text::secondary(label.to_uppercase())
+                    .font_size(11.0)
+                    .bold(true)
+                    .padding_left(4.0),
+            ),
+            Box::new(
+                RawView::new(column(0.0))
+                    .background(theme.colors.surface_elevated)
+                    .corner_radius(16.0)
+                    .outline(theme.colors.border, 1.0)
+                    .with_children(children),
+            ),
+        ],
+    )
+}
+
+fn setting_row(icon: Symbol, label: &str, hint: &str, control: BoxedWidget) -> BoxedWidget {
+    let theme = use_theme();
+    let mut text: Vec<BoxedWidget> = vec![Box::new(Text::new(label).font_size(13.0))];
+    if !hint.is_empty() {
+        text.push(Box::new(Text::secondary(hint).font_size(11.0)));
+    }
+    view(
+        pad(
+            Style {
+                min_size: creamui_core::layout::Size {
+                    width: Dimension::Length(0.0),
+                    height: Dimension::Length(62.0),
+                },
+                flex_shrink: 0.0,
+                ..row(12.0)
+            },
+            16.0,
+            12.0,
+        ),
+        vec![
+            Box::new(
+                RawView::new(Style {
+                    justify_content: Some(creamui_core::layout::JustifyContent::Center),
+                    ..fixed(28.0, 28.0)
+                })
+                .background(theme.colors.surface.mix(theme.colors.accent, 0.1))
+                .corner_radius(8.0)
+                .child(Box::new(Icon::new(icon, theme.colors.accent).size(16.0))),
+            ),
+            view(
+                Style {
+                    flex_grow: 1.0,
+                    flex_shrink: 1.0,
+                    flex_basis: Dimension::Length(0.0),
+                    ..column(3.0)
+                },
+                text,
+            ),
+            view(
+                Style {
+                    flex_shrink: 0.0,
+                    ..row(0.0)
+                },
+                vec![control],
+            ),
+        ],
+    )
+}
 fn heading(title: &str, subtitle: &str) -> BoxedWidget {
     view(
         column(6.0),
@@ -385,6 +602,67 @@ mod tests {
     use creamui_core::Renderer;
     use creamui_render::{Damage, Rasterizer, SceneRecorder, WindowDecorations};
     use creamui_theme::{Theme, ThemeProvider};
+    #[test]
+    fn general_island_controls_render_edit_and_restore_defaults() {
+        for (appearance, theme) in [("light", Theme::light()), ("dark", Theme::dark())] {
+            creamui_reactive::with_context_scope(|| {
+                creamui_reactive::provide_context(ThemeProvider::new(theme));
+                creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
+                let state = State::new();
+                state.config.set(Config::default());
+                state.saved.set(Config::default());
+                for (width, height, offset) in [(720, 640, 0.0), (480, 420, 0.0), (480, 420, 220.0)]
+                {
+                    state.scroll.set(offset);
+                    let mut recorder = SceneRecorder::new();
+                    recorder.begin(width, height, 1.0, CLEAR, theme.colors);
+                    let size = Size {
+                        width: width as f32,
+                        height: height as f32,
+                    };
+                    let _ = Renderer::new().render(state.build(size), size, &mut recorder);
+                    if let Some(dir) = std::env::var_os("DTERM_SNAPSHOT_DIR") {
+                        let mut raster = Rasterizer::new(width, height);
+                        raster.render(&recorder.finish(), &Damage::Full);
+                        raster
+                            .pixmap()
+                            .save_png(PathBuf::from(dir).join(format!(
+                                "settings-general-{appearance}-{width}-{offset}.png"
+                            )))
+                            .unwrap();
+                    }
+                }
+                state.scroll.set(0.0);
+                let size = Size {
+                    width: 720.0,
+                    height: 640.0,
+                };
+                let mut recorder = SceneRecorder::new();
+                recorder.begin(720, 640, 1.0, CLEAR, theme.colors);
+                let scene = Renderer::new().render(state.build(size), size, &mut recorder);
+                let enter = creamui_core::KeyInput {
+                    key: creamui_core::Key::Enter,
+                    modifiers: Default::default(),
+                };
+                scene
+                    .on_key_at(6)
+                    .expect("vertical orientation is keyboard accessible")(enter);
+                assert_eq!(
+                    state.config.peek().island.orientation,
+                    Orientation::Vertical
+                );
+                scene
+                    .on_key_at(4)
+                    .expect("enabled switch is keyboard accessible")(enter);
+                assert!(!state.config.peek().island.enabled);
+                scene
+                    .on_key_at(9)
+                    .expect("restore defaults is keyboard accessible")(enter);
+                assert_eq!(state.config.peek(), Config::default());
+            });
+        }
+    }
+
     #[test]
     fn recorder_detects_conflicts_cancels_clears_and_saves_atomically() {
         creamui_reactive::with_context_scope(|| {

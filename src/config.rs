@@ -12,12 +12,14 @@ use std::{
 #[serde(from = "FileConfig")]
 pub struct Config {
     pub shell: String,
+    pub island: crate::island::Config,
     pub shortcuts: BTreeMap<String, String>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     shell: Option<String>,
+    island: crate::island::Config,
     shortcuts: BTreeMap<String, String>,
 }
 impl From<FileConfig> for Config {
@@ -27,6 +29,7 @@ impl From<FileConfig> for Config {
             config.shell = shell;
         }
         config.shortcuts.extend(file.shortcuts);
+        config.island = file.island;
         config
     }
 }
@@ -34,6 +37,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             shell: "bash".into(),
+            island: crate::island::Config::default(),
             shortcuts: Action::all()
                 .into_iter()
                 .map(|a| (a.id(), a.default_binding()))
@@ -182,6 +186,29 @@ mod tests {
         assert!(Config::parse("[shortcuts]\nnew_tab='Ctrl+Shift+N'").is_err());
         assert!(Config::parse("shell=''").is_err());
         assert!(Config::parse("[shortcuts]\nunknown='Ctrl+K'").is_err());
+    }
+    #[test]
+    fn island_config_defaults_roundtrip_and_validation() {
+        use crate::island::{Horizontal, Orientation, Vertical};
+        assert_eq!(
+            Config::parse("shell='bash'").unwrap().island,
+            crate::island::Config::default()
+        );
+        let config = Config::parse("[island]\nenabled=false\norientation='vertical'\nhorizontal='right'\nvertical='center'").unwrap();
+        assert!(!config.island.enabled);
+        assert_eq!(config.island.orientation, Orientation::Vertical);
+        assert_eq!(config.island.horizontal, Horizontal::Right);
+        assert_eq!(config.island.vertical, Vertical::Center);
+        assert_eq!(
+            Config::parse(&toml::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+        let partial = Config::parse("[island]\nhorizontal='left'").unwrap();
+        assert!(partial.island.enabled);
+        assert_eq!(partial.island.vertical, Vertical::Bottom);
+        assert!(Config::parse("[island]\norientation='diagonal'").is_err());
+        assert!(Config::parse("[island]\nvertical='left'").is_err());
+        assert!(Config::parse("[island]\nunknown=true").is_err());
     }
     #[test]
     fn config_roundtrip_and_system_fallback() {

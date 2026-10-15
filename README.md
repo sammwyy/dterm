@@ -8,6 +8,8 @@ The executable is `dterm`; the desktop name is **Terminal**.
 - System theme, live CreamUI theme updates, and hybrid compositor decorations.
 - UTF-8, ANSI/256/truecolor text, cursor addressing, alternate screen and 10,000 lines of scrollback.
 - Text selection, clipboard copy/paste and bracketed paste.
+- Scrollback search with a floating input, optional regex, match highlighting and previous/next navigation.
+- A reusable control island with per-tab modes, configurable orientation and nine screen positions.
 - Configurable shell (`bash` by default), with `sh` and `bash` fallbacks, or an explicit custom command.
 - Settings open in a separate `dterm --settings` process: General, Shortcuts and About.
   Package version, author, license and repository links are embedded from `Cargo.toml`.
@@ -39,11 +41,30 @@ for Tab and function keys to reach terminal applications.
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Alt+1 … Alt+9 | Select tab |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy selection / paste |
+| Ctrl+Shift+F | Search scrollback |
 | Ctrl+Comma | Open settings |
 | Shift+PageUp / PageDown, mouse wheel | Scroll history |
 
 Applications using the alternate screen keep their own screen contents. Mouse
 reporting, hyperlinks and image protocols are not implemented yet.
+
+Scrollback search opens the control island at the bottom center for the active tab and searches both the
+visible screen and retained history. Type to search, toggle **.*** for regular
+expressions, and use **↑ / ↓** or **Shift+Enter / Enter** to visit the previous /
+next match. Navigation wraps around and the counter shows the current match and
+total. Matches are highlighted, including text spanning soft-wrapped lines;
+invalid regex patterns display an error. Search is case-sensitive (use `(?i)`
+in regex mode for case-insensitive matching). **Escape** or **×** closes the bar
+and returns keyboard input to the terminal. Each tab retains its own query.
+Change or disable the opening shortcut in **Settings → Shortcuts → Terminal**.
+
+**Settings → General → Control island** controls whether modes are enabled,
+the horizontal or vertical layout, and independent horizontal (left, center,
+right) and vertical (top, center, bottom) placement. Changes apply live after
+saving. Disabling the island closes active modes in every tab and ignores
+their activation shortcuts; the terminal continues receiving normal input.
+The island stays within the terminal area, clear of the header and status bar.
+Vertical layouts scroll when the window is too short to fit every control.
 
 ## Configuration
 
@@ -55,6 +76,12 @@ the user file atomically when you click **Save changes**.
 ```toml
 shell = "bash"
 
+[island]
+enabled = true
+orientation = "horizontal" # horizontal | vertical
+horizontal = "center"    # left | center | right
+vertical = "bottom"      # top | center | bottom
+
 [shortcuts]
 new_tab = "Ctrl+Shift+T"
 new_window = "Ctrl+Shift+N"
@@ -64,6 +91,7 @@ previous_tab = "Ctrl+Shift+Tab"
 tab_1 = "Alt+1"
 copy = "Ctrl+Shift+C"
 paste = "Ctrl+Shift+V"
+search = "Ctrl+Shift+F"
 settings = "Ctrl+Comma"
 scroll_up = "Shift+PageUp"
 scroll_down = "Shift+PageDown"
@@ -89,6 +117,15 @@ install -Dm644 data/dterm.desktop ~/.local/share/applications/dterm.desktop
 ```
 
 ## Development
+
+`src/island.rs` provides the shared surface and placement settings. Commands
+activate a per-session `Mode` through `State::activate_mode`; `Escape` and the
+close control dismiss it. `Mode::Search` is the first mode, activated by the
+configurable `search` shortcut. New modes supply their content and preferred
+size through `State::control_island`, and implement their state updates in
+`Session::set_mode` / `refresh_mode` and keyboard handling in `State::key`.
+Keyboard callbacks must remain independent of theme/context hooks; styling
+belongs to the window build.
 
 ```sh
 cargo test --locked

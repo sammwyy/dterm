@@ -10,6 +10,7 @@ pub enum Action {
     SelectTab(usize),
     Copy,
     Paste,
+    Search,
     Settings,
     ScrollUp,
     ScrollDown,
@@ -20,7 +21,7 @@ impl Action {
         [NewTab, NewWindow, CloseTab, NextTab, PreviousTab]
             .into_iter()
             .chain((1..=9).map(SelectTab))
-            .chain([Copy, Paste, Settings, ScrollUp, ScrollDown])
+            .chain([Copy, Paste, Search, Settings, ScrollUp, ScrollDown])
             .collect()
     }
     pub fn id(self) -> String {
@@ -34,6 +35,7 @@ impl Action {
                 Self::PreviousTab => "previous_tab",
                 Self::Copy => "copy",
                 Self::Paste => "paste",
+                Self::Search => "search",
                 Self::Settings => "settings",
                 Self::ScrollUp => "scroll_up",
                 Self::ScrollDown => "scroll_down",
@@ -53,6 +55,7 @@ impl Action {
                 Self::PreviousTab => "Previous tab",
                 Self::Copy => "Copy selection",
                 Self::Paste => "Paste",
+                Self::Search => "Search scrollback",
                 Self::Settings => "Open settings",
                 Self::ScrollUp => "Scroll page up",
                 Self::ScrollDown => "Scroll page down",
@@ -72,6 +75,7 @@ impl Action {
                 Self::PreviousTab => "Ctrl+Shift+Tab",
                 Self::Copy => "Ctrl+Shift+C",
                 Self::Paste => "Ctrl+Shift+V",
+                Self::Search => "Ctrl+Shift+F",
                 Self::Settings => "Ctrl+Comma",
                 Self::ScrollUp => "Shift+PageUp",
                 Self::ScrollDown => "Shift+PageDown",
