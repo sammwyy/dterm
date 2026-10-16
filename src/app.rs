@@ -333,6 +333,40 @@ impl State {
                         self.confirm_paste();
                     }
                 }
+                Mode::Palette => match event.key {
+                    Key::Enter => {
+                        if let Some(action) = self.palette_actions().into_iter().next() {
+                            self.close_mode();
+                            self.dispatch(action);
+                        }
+                    }
+                    _ => {
+                        let action = self
+                            .bindings
+                            .borrow()
+                            .iter()
+                            .find(|(_, binding)| binding.matches(&event.key, m))
+                            .map(|(action, _)| *action);
+                        if action == Some(Action::Palette) {
+                            return true;
+                        }
+                        if let Some(key) = search_key(&event.key) {
+                            if let Some(editor) = self.palette_editor() {
+                                if let Some(handler) = editor.on_key() {
+                                    handler(creamui_core::KeyInput {
+                                        key,
+                                        modifiers: creamui_core::Modifiers {
+                                            ctrl: m.ctrl,
+                                            shift: m.shift,
+                                            alt: m.alt,
+                                            logo: m.logo,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                },
             }
             return true;
         }
@@ -403,6 +437,7 @@ impl State {
             Action::Copy => self.copy(),
             Action::Paste => self.paste(),
             Action::Search => self.activate_mode(Mode::Search),
+            Action::Palette => self.activate_mode(Mode::Palette),
             Action::Settings => open_settings(),
             Action::ScrollUp | Action::ScrollDown => {
                 if let Some(tab) = self.current() {
@@ -520,6 +555,72 @@ impl State {
                 .border(theme.colors.accent, 1.0)
                 .selection_background(theme.colors.accent.mix(theme.colors.surface, 0.5)),
         ))
+    }
+    fn edit_palette(&self, edit: impl FnOnce(&mut crate::terminal::Palette)) {
+        if let Some(tab) = self.current() {
+            edit(&mut tab.session.borrow_mut().palette);
+            self.revision.update(|value| *value = value.wrapping_add(1));
+        }
+    }
+    fn palette_editor(&self) -> Option<RawTextInput> {
+        let tab = self.current()?;
+        let session = tab.session.borrow();
+        let palette = &session.palette;
+        let change = self.clone();
+        let cursor = self.clone();
+        let selection = self.clone();
+        Some(
+            RawTextInput::new(
+                pad(
+                    Style {
+                        flex_grow: 1.0,
+                        flex_shrink: 1.0,
+                        flex_basis: Dimension::Length(0.0),
+                        ..fixed(220.0, 34.0)
+                    },
+                    10.0,
+                    0.0,
+                ),
+                palette.query.clone(),
+                14.0,
+                CLEAR,
+                move |value| change.edit_palette(|palette| palette.query = value),
+            )
+            .cursor(palette.cursor, move |value| {
+                cursor.edit_palette(|palette| palette.cursor = value)
+            })
+            .selection(palette.selection, move |value| {
+                selection.edit_palette(|palette| palette.selection = value)
+            }),
+        )
+    }
+    fn palette_input(&self) -> Option<crate::search::SearchInput> {
+        let editor = self.palette_editor()?;
+        let theme = use_theme();
+        Some(crate::search::SearchInput(
+            editor
+                .color(theme.colors.text_primary)
+                .placeholder("Type an action…", theme.colors.text_secondary)
+                .background(theme.colors.surface)
+                .corner_radius(6.0)
+                .border(theme.colors.accent, 1.0)
+                .selection_background(theme.colors.accent.mix(theme.colors.surface, 0.5)),
+        ))
+    }
+    fn palette_actions(&self) -> Vec<Action> {
+        let query = self
+            .current()
+            .map(|tab| tab.session.borrow().palette.query.to_lowercase())
+            .unwrap_or_default();
+        Action::all()
+            .into_iter()
+            .filter(|action| *action != Action::Palette)
+            .filter(|action| {
+                query.is_empty()
+                    || action.label().to_lowercase().contains(&query)
+                    || action.id().contains(&query)
+            })
+            .collect()
     }
     fn search_content(
         &self,
@@ -646,6 +747,41 @@ impl State {
             preferred,
         ))
     }
+    fn palette_content(&self, orientation: Orientation) -> Option<(BoxedWidget, Size)> {
+        let input = self.palette_input()?;
+        let vertical = orientation == Orientation::Vertical;
+        let actions = self.palette_actions();
+        let preferred = Size {
+            width: 440.0,
+            height: if vertical { 360.0 } else { 282.0 },
+        };
+        let mut children: Vec<BoxedWidget> = vec![Box::new(input)];
+        if actions.is_empty() {
+            children.push(Box::new(
+                Text::secondary("No matching actions.").font_size(12.0),
+            ));
+        } else {
+            for action in actions.into_iter().take(8) {
+                let invoke = self.clone();
+                let shortcut = self
+                    .bindings
+                    .borrow()
+                    .iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .map(|(_, binding)| binding.display())
+                    .unwrap_or_else(|| "Unassigned".into());
+                children.push(button(
+                    &format!("{}  ·  {shortcut}", action.label()),
+                    424.0,
+                    move || {
+                        invoke.close_mode();
+                        invoke.dispatch(action);
+                    },
+                ));
+            }
+        }
+        Some((view(column(6.0), children), preferred))
+    }
     fn control_island(&self, area: Rect) -> Option<BoxedWidget> {
         let config = self.config.get().island;
         let tab = self.current()?;
@@ -656,6 +792,7 @@ impl State {
         let (content, preferred) = match mode {
             Mode::Search => self.search_content(config.orientation, area.width)?,
             Mode::PasteConfirm => self.paste_confirmation_content(config.orientation)?,
+            Mode::Palette => self.palette_content(config.orientation)?,
         };
         Some(island::surface(
             &config,
@@ -1497,6 +1634,31 @@ mod tests {
         state.configure(config);
         state.paste_text("without\nconfirmation");
         assert_eq!(tab.session.borrow().control_mode, None);
+        state.cleanup();
+    }
+
+    #[test]
+    fn command_palette_filters_and_invokes_the_first_matching_action() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let state = State::new(
+            crate::terminal::idle_cwd(),
+            crate::terminal::idle_command(),
+            tx,
+        );
+        state.add();
+        state.activate_mode(Mode::Palette);
+        state.edit_palette(|palette| palette.query = "new tab".into());
+        assert_eq!(state.palette_actions(), vec![Action::NewTab]);
+        state.key(
+            KeyEvent {
+                key: Key::Enter,
+                pressed: true,
+                synthetic: false,
+            },
+            Modifiers::default(),
+        );
+        assert_eq!(state.tabs.peek().len(), 2);
+        assert_eq!(state.current().unwrap().session.borrow().control_mode, None);
         state.cleanup();
     }
 

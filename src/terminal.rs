@@ -1,5 +1,6 @@
 //! PTY lifetime, bounded output delivery and VT state. No GUI work happens on workers.
 use anyhow::{Context, Result};
+use creamui_widgets::TextSelection;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::{
     collections::BTreeMap,
@@ -16,6 +17,13 @@ pub struct SessionOptions {
     pub environment: BTreeMap<String, String>,
     pub scrollback: usize,
     pub theme: crate::config::TerminalTheme,
+}
+
+#[derive(Default)]
+pub struct Palette {
+    pub query: String,
+    pub cursor: usize,
+    pub selection: TextSelection,
 }
 impl Default for SessionOptions {
     fn default() -> Self {
@@ -129,6 +137,7 @@ pub struct Session {
     pub search: crate::search::Search,
     pub control_mode: Option<crate::island::Mode>,
     pub pending_paste: Option<String>,
+    pub palette: Palette,
     master: Box<dyn MasterPty + Send>,
     input: Option<SyncSender<Vec<u8>>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -297,6 +306,7 @@ impl Session {
             search: crate::search::Search::default(),
             control_mode: None,
             pending_paste: None,
+            palette: Palette::default(),
             master: pair.master,
             input: Some(input),
             killer,
@@ -347,6 +357,7 @@ impl Session {
                 self.search.reveal(self.parser.screen_mut());
             }
             Some(crate::island::Mode::PasteConfirm) => {}
+            Some(crate::island::Mode::Palette) => self.palette = Palette::default(),
             None => {
                 self.search.clear();
                 self.pending_paste = None;
@@ -357,6 +368,7 @@ impl Session {
         match self.control_mode {
             Some(crate::island::Mode::Search) => self.search.refresh(self.parser.screen()),
             Some(crate::island::Mode::PasteConfirm) => {}
+            Some(crate::island::Mode::Palette) => {}
             None => {}
         }
     }
