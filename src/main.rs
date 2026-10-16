@@ -9,6 +9,7 @@ mod input;
 mod island;
 mod screen;
 mod search;
+mod session;
 mod settings;
 mod shortcuts;
 mod terminal;
@@ -49,7 +50,10 @@ fn run_terminal(cwd: std::path::PathBuf, command: Vec<String>) {
     if let Ok(config) = &configuration {
         state.configure(config.clone());
     }
-    state.add();
+    state.enable_session_restore();
+    if !state.restore_session() {
+        state.add();
+    }
     if let Err(error) = configuration {
         state.show_error(error);
     }

@@ -52,6 +52,7 @@ pub struct State {
     pub window: Rc<RefCell<Option<WindowHandle>>>,
     maximized: Signal<bool>,
     clipboard: Rc<RefCell<Option<arboard::Clipboard>>>,
+    session_file: Rc<RefCell<Option<PathBuf>>>,
 }
 impl State {
     pub fn new(cwd: PathBuf, command: Vec<String>, sender: SyncSender<Event>) -> Self {
@@ -75,13 +76,18 @@ impl State {
             window: Rc::new(RefCell::new(None)),
             maximized: Signal::new(false),
             clipboard: Rc::new(RefCell::new(None)),
+            session_file: Rc::new(RefCell::new(None)),
         }
     }
     pub fn add(&self) {
+        self.add_with(None, None);
+    }
+    fn add_with(&self, restored_cwd: Option<PathBuf>, manual_title: Option<String>) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let config = self.config.peek();
-        let active_cwd = self.current().map(|tab| tab.session.borrow().cwd.clone());
+        let active_cwd =
+            restored_cwd.or_else(|| self.current().map(|tab| tab.session.borrow().cwd.clone()));
         let (command, cwd, options) = if self.command.is_empty() {
             match config.active_profile() {
                 Ok(profile) => {
@@ -129,7 +135,8 @@ impl State {
                 .map_err(|e| format!("{e:#}"))
         });
         match result {
-            Ok(session) => {
+            Ok(mut session) => {
+                session.manual_title = manual_title;
                 let index = self.tabs.peek().len();
                 self.tabs.update(|tabs| {
                     tabs.push(Tab {
@@ -140,6 +147,7 @@ impl State {
                 });
                 self.active.set(index);
                 self.error.set(None);
+                self.persist_session();
             }
             Err(e) => self
                 .error
@@ -165,10 +173,69 @@ impl State {
         };
         self.tabs.set(tabs);
         self.active.set(next);
+        self.persist_session();
     }
     pub fn cleanup(&self) {
+        self.persist_session();
         self.tabs.set(Vec::new());
         self.window.borrow_mut().take();
+    }
+    pub fn enable_session_restore(&self) {
+        *self.session_file.borrow_mut() = Some(crate::session::path());
+    }
+    pub fn restore_session(&self) -> bool {
+        if !self.config.peek().restore_session || !self.command.is_empty() {
+            return false;
+        }
+        let Some(path) = self.session_file.borrow().clone() else {
+            return false;
+        };
+        let saved = match crate::session::load(&path) {
+            Ok(Some(saved)) => saved,
+            Ok(None) => return false,
+            Err(error) => {
+                self.show_error(format!("Couldn't restore session: {error}"));
+                return false;
+            }
+        };
+        let start = self.tabs.peek().len();
+        for tab in saved.tabs {
+            if tab.cwd.is_dir() {
+                self.add_with(Some(tab.cwd), tab.manual_title);
+            }
+        }
+        let restored = self.tabs.peek().len().saturating_sub(start);
+        if restored == 0 {
+            return false;
+        }
+        self.active.set(start + saved.active.min(restored - 1));
+        self.persist_session();
+        true
+    }
+    fn persist_session(&self) {
+        if !self.config.peek().restore_session {
+            return;
+        }
+        let Some(path) = self.session_file.borrow().clone() else {
+            return;
+        };
+        let tabs = self.tabs.peek();
+        let session = crate::session::SavedSession {
+            active: self.active.peek().min(tabs.len().saturating_sub(1)),
+            tabs: tabs
+                .iter()
+                .map(|tab| {
+                    let session = tab.session.borrow();
+                    crate::session::SavedTab {
+                        cwd: session.cwd.clone(),
+                        manual_title: session.manual_title.clone(),
+                    }
+                })
+                .collect(),
+        };
+        if let Err(error) = crate::session::save(&path, &session) {
+            self.show_error(format!("Couldn't save session: {error}"));
+        }
     }
     fn current(&self) -> Option<Tab> {
         self.tabs.peek().get(self.active.peek()).cloned()
@@ -435,6 +502,13 @@ impl State {
                     self.config.set(config);
                     self.metrics.set(metrics);
                 });
+                if !self.config.peek().restore_session {
+                    if let Some(path) = self.session_file.borrow().as_ref() {
+                        if let Err(error) = crate::session::clear(path) {
+                            self.show_error(format!("Couldn't clear saved session: {error}"));
+                        }
+                    }
+                }
             }
             Err(error) => self.show_error(error),
         }
@@ -452,6 +526,7 @@ impl State {
             Action::SelectTab(index) => {
                 if (1..=self.tabs.peek().len()).contains(&index) {
                     self.active.set(index - 1);
+                    self.persist_session();
                 }
             }
             Action::Copy => self.copy(),
@@ -519,6 +594,7 @@ impl State {
             session.manual_title = (!title.is_empty()).then(|| title.to_string());
             session.control_mode = None;
             drop(session);
+            self.persist_session();
             self.revision.update(|value| *value = value.wrapping_add(1));
         }
     }
@@ -850,6 +926,7 @@ impl State {
                             session.manual_title = None;
                             session.control_mode = None;
                         }
+                        clear.persist_session();
                         clear
                             .revision
                             .update(|value| *value = value.wrapping_add(1));
@@ -910,6 +987,7 @@ impl State {
         if n > 0 {
             self.active
                 .set((self.active.peek() as isize + direction).rem_euclid(n as isize) as usize);
+            self.persist_session();
         }
     }
     fn event(&self, event: Event) {
@@ -933,11 +1011,16 @@ impl State {
         {
             match event {
                 Event::Output(_, bytes) => {
+                    let previous_cwd = tab.session.borrow().cwd.clone();
                     let result = tab.session.borrow_mut().process(&bytes);
+                    let cwd_changed = tab.session.borrow().cwd != previous_cwd;
                     creamui_reactive::batch(|| {
                         tab.selection.set(None);
                         self.report(result);
                     });
+                    if cwd_changed {
+                        self.persist_session();
+                    }
                 }
                 Event::Exited(_, status) => tab.session.borrow_mut().finish(status),
                 Event::Configuration(_) => unreachable!(),
@@ -1770,6 +1853,42 @@ mod tests {
         state.rename_tab();
         assert_eq!(State::tab_title(&tab), "automatic");
         state.cleanup();
+    }
+
+    #[test]
+    fn sessions_restore_tabs_directories_and_manual_titles() {
+        let root = std::env::temp_dir().join(format!(
+            "dterm-app-session-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = root.join("session.toml");
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let state = State::new(crate::terminal::idle_cwd(), Vec::new(), tx);
+        *state.session_file.borrow_mut() = Some(file.clone());
+        state.add();
+        state.current().unwrap().session.borrow_mut().manual_title = Some("First".into());
+        state.add();
+        state.current().unwrap().session.borrow_mut().manual_title = Some("Second".into());
+        state.active.set(0);
+        state.cleanup();
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let restored = State::new(crate::terminal::idle_cwd(), Vec::new(), tx);
+        *restored.session_file.borrow_mut() = Some(file.clone());
+        let did_restore = restored.restore_session();
+        assert!(did_restore);
+        assert_eq!(restored.tabs.peek().len(), 2);
+        assert_eq!(restored.active.peek(), 0);
+        assert_eq!(State::tab_title(&restored.tabs.peek()[0]), "First");
+        assert_eq!(State::tab_title(&restored.tabs.peek()[1]), "Second");
+        restored.cleanup();
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let explicit = State::new(crate::terminal::idle_cwd(), vec!["echo".into()], tx);
+        *explicit.session_file.borrow_mut() = Some(file.clone());
+        assert!(!explicit.restore_session());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
