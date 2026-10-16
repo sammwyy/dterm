@@ -211,6 +211,13 @@ impl State {
                 );
                 return;
             }
+            if self.config.peek().confirm_multiline_paste
+                && (text.contains('\n') || text.contains('\r'))
+            {
+                tab.session.borrow_mut().pending_paste = Some(text.into());
+                self.activate_mode(Mode::PasteConfirm);
+                return;
+            }
             let result = {
                 let mut session = tab.session.borrow_mut();
                 let bracketed = session.parser.screen().bracketed_paste();
@@ -219,6 +226,22 @@ impl State {
             };
             self.input_changed(&tab, result);
         }
+    }
+    fn confirm_paste(&self) {
+        let Some(tab) = self.current() else {
+            return;
+        };
+        let result = {
+            let mut session = tab.session.borrow_mut();
+            let Some(text) = session.pending_paste.take() else {
+                return;
+            };
+            let bracketed = session.parser.screen().bracketed_paste();
+            session.parser.screen_mut().set_scrollback(0);
+            session.control_mode = None;
+            session.write(crate::input::paste(&text, bracketed))
+        };
+        self.input_changed(&tab, result);
     }
     /// Signals can redraw synchronously: callers must release the session first.
     fn input_changed(&self, tab: &Tab, result: anyhow::Result<()>) {
@@ -305,6 +328,11 @@ impl State {
                         }
                     }
                 },
+                Mode::PasteConfirm => {
+                    if event.key == Key::Enter {
+                        self.confirm_paste();
+                    }
+                }
             }
             return true;
         }
@@ -343,7 +371,10 @@ impl State {
                 creamui_reactive::batch(|| {
                     if !config.island.enabled {
                         for tab in self.tabs.peek() {
-                            tab.session.borrow_mut().set_mode(None);
+                            let mut session = tab.session.borrow_mut();
+                            if session.control_mode == Some(Mode::Search) {
+                                session.set_mode(None);
+                            }
                         }
                     }
                     *self.bindings.borrow_mut() = bindings;
@@ -408,7 +439,7 @@ impl State {
         }
     }
     fn activate_mode(&self, mode: Mode) {
-        if !self.config.peek().island.enabled {
+        if !self.config.peek().island.enabled && mode == Mode::Search {
             return;
         }
         if let Some(tab) = self.current() {
@@ -566,15 +597,65 @@ impl State {
         );
         Some((content, preferred))
     }
+    fn paste_confirmation_content(&self, orientation: Orientation) -> Option<(BoxedWidget, Size)> {
+        let tab = self.current()?;
+        let pending = tab.session.borrow().pending_paste.as_ref()?.clone();
+        let lines = pending.matches('\n').count() + pending.matches('\r').count() + 1;
+        let confirm = self.clone();
+        let cancel = self.clone();
+        let vertical = orientation == Orientation::Vertical;
+        let preferred = if vertical {
+            Size {
+                width: 260.0,
+                height: 154.0,
+            }
+        } else {
+            Size {
+                width: 460.0,
+                height: 82.0,
+            }
+        };
+        Some((
+            view(
+                if vertical { column(8.0) } else { row(8.0) },
+                vec![
+                    view(
+                        Style {
+                            flex_grow: 1.0,
+                            flex_basis: Dimension::Length(0.0),
+                            ..column(2.0)
+                        },
+                        vec![
+                            Box::new(Text::new("Paste multiple lines?").font_size(14.0)),
+                            Box::new(
+                                Text::secondary(format!(
+                                    "This will send {lines} lines to the terminal."
+                                ))
+                                .font_size(12.0),
+                            ),
+                        ],
+                    ),
+                    button("Cancel", if vertical { 244.0 } else { 68.0 }, move || {
+                        cancel.close_mode()
+                    }),
+                    button("Paste", if vertical { 244.0 } else { 62.0 }, move || {
+                        confirm.confirm_paste()
+                    }),
+                ],
+            ),
+            preferred,
+        ))
+    }
     fn control_island(&self, area: Rect) -> Option<BoxedWidget> {
         let config = self.config.get().island;
-        if !config.enabled {
-            return None;
-        }
         let tab = self.current()?;
         let mode = tab.session.borrow().control_mode?;
+        if !config.enabled && mode == Mode::Search {
+            return None;
+        }
         let (content, preferred) = match mode {
             Mode::Search => self.search_content(config.orientation, area.width)?,
+            Mode::PasteConfirm => self.paste_confirmation_content(config.orientation)?,
         };
         Some(island::surface(
             &config,
@@ -1381,6 +1462,42 @@ mod tests {
             drop(effect);
             state.cleanup();
         });
+    }
+
+    #[test]
+    fn multiline_paste_requires_confirmation_and_can_be_disabled() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let state = State::new(
+            crate::terminal::idle_cwd(),
+            crate::terminal::idle_command(),
+            tx,
+        );
+        state.add();
+        let tab = state.current().unwrap();
+        state.paste_text("first\nsecond");
+        assert_eq!(tab.session.borrow().control_mode, Some(Mode::PasteConfirm));
+        assert_eq!(
+            tab.session.borrow().pending_paste.as_deref(),
+            Some("first\nsecond")
+        );
+        state.key(
+            KeyEvent {
+                key: Key::Enter,
+                pressed: true,
+                synthetic: false,
+            },
+            Modifiers::default(),
+        );
+        assert_eq!(tab.session.borrow().control_mode, None);
+        assert!(tab.session.borrow().pending_paste.is_none());
+        state.paste_text("single line");
+        assert_eq!(tab.session.borrow().control_mode, None);
+        let mut config = state.config.peek();
+        config.confirm_multiline_paste = false;
+        state.configure(config);
+        state.paste_text("without\nconfirmation");
+        assert_eq!(tab.session.borrow().control_mode, None);
+        state.cleanup();
     }
 
     #[test]

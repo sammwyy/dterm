@@ -128,6 +128,7 @@ pub struct Session {
     pub exited: Option<String>,
     pub search: crate::search::Search,
     pub control_mode: Option<crate::island::Mode>,
+    pub pending_paste: Option<String>,
     master: Box<dyn MasterPty + Send>,
     input: Option<SyncSender<Vec<u8>>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -295,6 +296,7 @@ impl Session {
             exited: None,
             search: crate::search::Search::default(),
             control_mode: None,
+            pending_paste: None,
             master: pair.master,
             input: Some(input),
             killer,
@@ -344,12 +346,17 @@ impl Session {
                 self.refresh_mode();
                 self.search.reveal(self.parser.screen_mut());
             }
-            None => self.search.clear(),
+            Some(crate::island::Mode::PasteConfirm) => {}
+            None => {
+                self.search.clear();
+                self.pending_paste = None;
+            }
         }
     }
     fn refresh_mode(&mut self) {
         match self.control_mode {
             Some(crate::island::Mode::Search) => self.search.refresh(self.parser.screen()),
+            Some(crate::island::Mode::PasteConfirm) => {}
             None => {}
         }
     }

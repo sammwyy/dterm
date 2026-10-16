@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Search,
+    PasteConfirm,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
