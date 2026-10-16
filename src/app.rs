@@ -408,14 +408,18 @@ impl State {
         };
         let pane_id = pane.id;
         let active = self.active.peek();
-        self.tabs.update(|tabs| {
-            if let Some(tab) = tabs.get_mut(active) {
-                if tab.panes.split(focused, orientation, pane) {
-                    tab.focus_pane(pane_id);
+        // `focus_pane` writes `active_pane`. That signal can synchronously rebuild the
+        // window, so keep the `tabs` borrow and the resulting redraw in one batch.
+        creamui_reactive::batch(|| {
+            self.tabs.update(|tabs| {
+                if let Some(tab) = tabs.get_mut(active) {
+                    if tab.panes.split(focused, orientation, pane) {
+                        tab.focus_pane(pane_id);
+                    }
                 }
-            }
+            });
+            self.revision.update(|value| *value = value.wrapping_add(1));
         });
-        self.revision.update(|value| *value = value.wrapping_add(1));
     }
     fn close_pane(&self) {
         let Some(tab) = self.current() else {
@@ -430,30 +434,34 @@ impl State {
         panes.retain(|pane| pane.id != focused);
         let next = panes.first().map(|pane| pane.id);
         let active = self.active.peek();
-        self.tabs.update(|tabs| {
-            if let Some(tab) = tabs.get_mut(active) {
-                if let Some(tree) = tab.panes.clone().without(focused) {
-                    tab.panes = tree;
-                    if let Some(next) = next {
-                        tab.focus_pane(next);
+        creamui_reactive::batch(|| {
+            self.tabs.update(|tabs| {
+                if let Some(tab) = tabs.get_mut(active) {
+                    if let Some(tree) = tab.panes.clone().without(focused) {
+                        tab.panes = tree;
+                        if let Some(next) = next {
+                            tab.focus_pane(next);
+                        }
                     }
                 }
-            }
+            });
+            self.revision.update(|value| *value = value.wrapping_add(1));
         });
-        self.revision.update(|value| *value = value.wrapping_add(1));
     }
     fn focus_pane(&self, id: u64) {
         self.window_focused.set(true);
         let active = self.active.peek();
         let mut changed = false;
-        self.tabs.update(|tabs| {
-            if let Some(tab) = tabs.get_mut(active) {
-                changed = tab.focus_pane(id);
+        creamui_reactive::batch(|| {
+            self.tabs.update(|tabs| {
+                if let Some(tab) = tabs.get_mut(active) {
+                    changed = tab.focus_pane(id);
+                }
+            });
+            if changed {
+                self.revision.update(|value| *value = value.wrapping_add(1));
             }
         });
-        if changed {
-            self.revision.update(|value| *value = value.wrapping_add(1));
-        }
     }
     fn focus_relative_pane(&self, direction: isize) {
         let Some(tab) = self.current() else {
@@ -2502,6 +2510,58 @@ mod tests {
             assert!(
                 renders.get() > 3,
                 "input should actually redraw the subscribed UI"
+            );
+            drop(effect);
+            state.cleanup();
+        });
+    }
+
+    #[test]
+    fn clicking_terminal_content_can_redraw_synchronously() {
+        creamui_reactive::with_context_scope(|| {
+            creamui_reactive::provide_context(ThemeProvider::new(Theme::light()));
+            creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
+            let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+            let state = State::new(
+                crate::terminal::idle_cwd(),
+                crate::terminal::idle_command(),
+                tx,
+            );
+            state.add();
+
+            let renders = Rc::new(std::cell::Cell::new(0));
+            let render_state = state.clone();
+            let count = renders.clone();
+            let effect = creamui_reactive::create_effect(move || {
+                let _tree = render_state.build(Size {
+                    width: 800.0,
+                    height: 600.0,
+                });
+                count.set(count.get() + 1);
+            });
+
+            let tab = state.current().unwrap();
+            let terminal = state.pane_view(
+                &tab.panes,
+                tab.active_pane.peek(),
+                false,
+                state.metrics.peek(),
+            );
+            let drag_start = terminal.on_drag_start().unwrap();
+            drag_start(
+                Point { x: 10.0, y: 10.0 },
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 800.0,
+                    height: 600.0,
+                },
+            );
+
+            assert_eq!(
+                renders.get(),
+                2,
+                "the click redraws after `tabs` is released"
             );
             drop(effect);
             state.cleanup();
