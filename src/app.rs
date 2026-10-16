@@ -35,6 +35,202 @@ struct Tab {
     session: Rc<RefCell<Session>>,
     selection: Signal<Option<Selection>>,
     island_scroll: ScrollController,
+    panes: PaneTree,
+    active_pane: Signal<u64>,
+}
+
+#[derive(Clone)]
+struct Pane {
+    id: u64,
+    session: Rc<RefCell<Session>>,
+    selection: Signal<Option<Selection>>,
+    island_scroll: ScrollController,
+}
+
+#[derive(Clone, Copy)]
+enum SplitOrientation {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone)]
+enum PaneTree {
+    Pane(Pane),
+    Split {
+        orientation: SplitOrientation,
+        ratio: f32,
+        first: Box<PaneTree>,
+        second: Box<PaneTree>,
+    },
+}
+
+impl PaneTree {
+    fn pane(&self, id: u64) -> Option<Pane> {
+        match self {
+            Self::Pane(pane) => (pane.id == id).then(|| pane.clone()),
+            Self::Split { first, second, .. } => first.pane(id).or_else(|| second.pane(id)),
+        }
+    }
+
+    fn pane_for_session(&self, session_id: u64) -> Option<Pane> {
+        match self {
+            Self::Pane(pane) => (pane.session.borrow().id == session_id).then(|| pane.clone()),
+            Self::Split { first, second, .. } => first
+                .pane_for_session(session_id)
+                .or_else(|| second.pane_for_session(session_id)),
+        }
+    }
+
+    fn panes(&self, result: &mut Vec<Pane>) {
+        match self {
+            Self::Pane(pane) => result.push(pane.clone()),
+            Self::Split { first, second, .. } => {
+                first.panes(result);
+                second.panes(result);
+            }
+        }
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.pane(id).is_some()
+    }
+
+    fn split(&mut self, id: u64, orientation: SplitOrientation, pane: Pane) -> bool {
+        match self {
+            Self::Pane(current) if current.id == id => {
+                let first = Box::new(Self::Pane(current.clone()));
+                *self = Self::Split {
+                    orientation,
+                    ratio: 0.5,
+                    first,
+                    second: Box::new(Self::Pane(pane)),
+                };
+                true
+            }
+            Self::Pane(_) => false,
+            Self::Split { first, second, .. } => {
+                first.split(id, orientation, pane.clone()) || second.split(id, orientation, pane)
+            }
+        }
+    }
+
+    fn without(self, id: u64) -> Option<Self> {
+        match self {
+            Self::Pane(pane) => (pane.id != id).then_some(Self::Pane(pane)),
+            Self::Split {
+                orientation,
+                ratio,
+                first,
+                second,
+            } => match (first.without(id), second.without(id)) {
+                (Some(first), Some(second)) => Some(Self::Split {
+                    orientation,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(tree), None) | (None, Some(tree)) => Some(tree),
+                (None, None) => None,
+            },
+        }
+    }
+
+    fn resize(&mut self, id: u64, amount: f32) -> bool {
+        let Self::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if first.resize(id, amount) || second.resize(id, amount) {
+            return true;
+        }
+        if first.contains(id) {
+            *ratio = (*ratio + amount).clamp(0.15, 0.85);
+            true
+        } else if second.contains(id) {
+            *ratio = (*ratio - amount).clamp(0.15, 0.85);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn resize_sessions(&self, rows: u16, columns: u16) -> Vec<anyhow::Result<()>> {
+        match self {
+            Self::Pane(pane) => vec![pane.session.borrow_mut().resize(rows, columns)],
+            Self::Split {
+                orientation,
+                ratio,
+                first,
+                second,
+            } => {
+                let (first_rows, first_columns, second_rows, second_columns) = match orientation {
+                    SplitOrientation::Horizontal => {
+                        let first_columns = if columns > 1 {
+                            ((columns as f32 * ratio).round() as u16).clamp(1, columns - 1)
+                        } else {
+                            1
+                        };
+                        (
+                            rows,
+                            first_columns,
+                            rows,
+                            columns.saturating_sub(first_columns).max(1),
+                        )
+                    }
+                    SplitOrientation::Vertical => {
+                        let first_rows = if rows > 1 {
+                            ((rows as f32 * ratio).round() as u16).clamp(1, rows - 1)
+                        } else {
+                            1
+                        };
+                        (
+                            first_rows,
+                            columns,
+                            rows.saturating_sub(first_rows).max(1),
+                            columns,
+                        )
+                    }
+                };
+                let mut result = first.resize_sessions(first_rows, first_columns);
+                result.extend(second.resize_sessions(second_rows, second_columns));
+                result
+            }
+        }
+    }
+}
+
+impl Tab {
+    fn new(pane: Pane) -> Self {
+        Self {
+            session: pane.session.clone(),
+            selection: pane.selection.clone(),
+            island_scroll: pane.island_scroll.clone(),
+            active_pane: Signal::new(pane.id),
+            panes: PaneTree::Pane(pane),
+        }
+    }
+
+    fn all_panes(&self) -> Vec<Pane> {
+        let mut panes = Vec::new();
+        self.panes.panes(&mut panes);
+        panes
+    }
+
+    fn focus_pane(&mut self, id: u64) -> bool {
+        let Some(pane) = self.panes.pane(id) else {
+            return false;
+        };
+        self.session = pane.session;
+        self.selection = pane.selection;
+        self.island_scroll = pane.island_scroll;
+        self.active_pane.set(id);
+        true
+    }
 }
 #[derive(Clone)]
 pub struct State {
@@ -85,11 +281,27 @@ impl State {
         self.add_with(None, None);
     }
     fn add_with(&self, restored_cwd: Option<PathBuf>, manual_title: Option<String>) {
+        let active_cwd =
+            restored_cwd.or_else(|| self.current().map(|tab| tab.session.borrow().cwd.clone()));
+        match self.spawn_pane(active_cwd, manual_title) {
+            Ok(pane) => {
+                let index = self.tabs.peek().len();
+                self.tabs.update(|tabs| tabs.push(Tab::new(pane)));
+                self.active.set(index);
+                self.error.set(None);
+                self.persist_session();
+            }
+            Err(error) => self.show_error(error),
+        }
+    }
+    fn spawn_pane(
+        &self,
+        active_cwd: Option<PathBuf>,
+        manual_title: Option<String>,
+    ) -> Result<Pane, String> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let config = self.config.peek();
-        let active_cwd =
-            restored_cwd.or_else(|| self.current().map(|tab| tab.session.borrow().cwd.clone()));
         let (command, cwd, options) = if self.command.is_empty() {
             match config.active_profile() {
                 Ok(profile) => {
@@ -136,25 +348,14 @@ impl State {
             Session::spawn_with(id, &cwd, &command, &options, self.sender.clone())
                 .map_err(|e| format!("{e:#}"))
         });
-        match result {
-            Ok(mut session) => {
-                session.manual_title = manual_title;
-                let index = self.tabs.peek().len();
-                self.tabs.update(|tabs| {
-                    tabs.push(Tab {
-                        session: Rc::new(RefCell::new(session)),
-                        selection: Signal::new(None),
-                        island_scroll: ScrollController::new(0.0),
-                    })
-                });
-                self.active.set(index);
-                self.error.set(None);
-                self.persist_session();
-            }
-            Err(e) => self
-                .error
-                .set(Some(format!("Couldn't open terminal: {e:#}"))),
-        }
+        let mut session = result.map_err(|error| format!("Couldn't open terminal: {error:#}"))?;
+        session.manual_title = manual_title;
+        Ok(Pane {
+            id,
+            session: Rc::new(RefCell::new(session)),
+            selection: Signal::new(None),
+            island_scroll: ScrollController::new(0.0),
+        })
     }
     fn close(&self, index: usize) {
         let mut tabs = self.tabs.peek();
@@ -176,6 +377,97 @@ impl State {
         self.tabs.set(tabs);
         self.active.set(next);
         self.persist_session();
+    }
+    fn split_pane(&self, orientation: SplitOrientation) {
+        let Some(tab) = self.current() else {
+            return;
+        };
+        let focused = tab.active_pane.peek();
+        let cwd = tab.session.borrow().cwd.clone();
+        let pane = match self.spawn_pane(Some(cwd), None) {
+            Ok(pane) => pane,
+            Err(error) => {
+                self.show_error(error);
+                return;
+            }
+        };
+        let pane_id = pane.id;
+        let active = self.active.peek();
+        self.tabs.update(|tabs| {
+            if let Some(tab) = tabs.get_mut(active) {
+                if tab.panes.split(focused, orientation, pane) {
+                    tab.focus_pane(pane_id);
+                }
+            }
+        });
+        self.revision.update(|value| *value = value.wrapping_add(1));
+    }
+    fn close_pane(&self) {
+        let Some(tab) = self.current() else {
+            return;
+        };
+        let focused = tab.active_pane.peek();
+        let mut panes = tab.all_panes();
+        if panes.len() <= 1 {
+            self.close(self.active.peek());
+            return;
+        }
+        panes.retain(|pane| pane.id != focused);
+        let next = panes.first().map(|pane| pane.id);
+        let active = self.active.peek();
+        self.tabs.update(|tabs| {
+            if let Some(tab) = tabs.get_mut(active) {
+                if let Some(tree) = tab.panes.clone().without(focused) {
+                    tab.panes = tree;
+                    if let Some(next) = next {
+                        tab.focus_pane(next);
+                    }
+                }
+            }
+        });
+        self.revision.update(|value| *value = value.wrapping_add(1));
+    }
+    fn focus_pane(&self, id: u64) {
+        let active = self.active.peek();
+        let mut changed = false;
+        self.tabs.update(|tabs| {
+            if let Some(tab) = tabs.get_mut(active) {
+                changed = tab.focus_pane(id);
+            }
+        });
+        if changed {
+            self.revision.update(|value| *value = value.wrapping_add(1));
+        }
+    }
+    fn focus_relative_pane(&self, direction: isize) {
+        let Some(tab) = self.current() else {
+            return;
+        };
+        let panes = tab.all_panes();
+        let Some(index) = panes
+            .iter()
+            .position(|pane| pane.id == tab.active_pane.peek())
+        else {
+            return;
+        };
+        let target = (index as isize + direction).rem_euclid(panes.len() as isize) as usize;
+        self.focus_pane(panes[target].id);
+    }
+    fn resize_pane(&self, amount: f32) {
+        let Some(tab) = self.current() else {
+            return;
+        };
+        let active = self.active.peek();
+        let focused = tab.active_pane.peek();
+        let mut changed = false;
+        self.tabs.update(|tabs| {
+            if let Some(tab) = tabs.get_mut(active) {
+                changed = tab.panes.resize(focused, amount);
+            }
+        });
+        if changed {
+            self.revision.update(|value| *value = value.wrapping_add(1));
+        }
     }
     pub fn cleanup(&self) {
         self.persist_session();
@@ -515,9 +807,11 @@ impl State {
                 creamui_reactive::batch(|| {
                     if !config.island.enabled {
                         for tab in self.tabs.peek() {
-                            let mut session = tab.session.borrow_mut();
-                            if session.control_mode == Some(Mode::Search) {
-                                session.set_mode(None);
+                            for pane in tab.all_panes() {
+                                let mut session = pane.session.borrow_mut();
+                                if session.control_mode == Some(Mode::Search) {
+                                    session.set_mode(None);
+                                }
                             }
                         }
                     }
@@ -585,6 +879,13 @@ impl State {
             Action::Palette => self.activate_mode(Mode::Palette),
             Action::RenameTab => self.activate_mode(Mode::RenameTab),
             Action::SaveOutput => self.activate_mode(Mode::SaveOutput),
+            Action::SplitHorizontal => self.split_pane(SplitOrientation::Horizontal),
+            Action::SplitVertical => self.split_pane(SplitOrientation::Vertical),
+            Action::ClosePane => self.close_pane(),
+            Action::FocusNextPane => self.focus_relative_pane(1),
+            Action::FocusPreviousPane => self.focus_relative_pane(-1),
+            Action::GrowPane => self.resize_pane(0.05),
+            Action::ShrinkPane => self.resize_pane(-0.05),
             Action::Settings => open_settings(),
             Action::ScrollUp | Action::ScrollDown => {
                 if let Some(tab) = self.current() {
@@ -1141,27 +1442,97 @@ impl State {
             }
             Event::Output(id, _) | Event::Exited(id, _) => *id,
         };
-        if let Some(tab) = self
+        if let Some(pane) = self
             .tabs
             .peek()
             .iter()
-            .find(|t| t.session.borrow().id == id)
+            .find_map(|tab| tab.panes.pane_for_session(id))
         {
             match event {
                 Event::Output(_, bytes) => {
-                    let previous_cwd = tab.session.borrow().cwd.clone();
-                    let result = tab.session.borrow_mut().process(&bytes);
-                    let cwd_changed = tab.session.borrow().cwd != previous_cwd;
+                    let previous_cwd = pane.session.borrow().cwd.clone();
+                    let result = pane.session.borrow_mut().process(&bytes);
+                    let cwd_changed = pane.session.borrow().cwd != previous_cwd;
                     creamui_reactive::batch(|| {
-                        tab.selection.set(None);
+                        pane.selection.set(None);
                         self.report(result);
                     });
                     if cwd_changed {
                         self.persist_session();
                     }
                 }
-                Event::Exited(_, status) => tab.session.borrow_mut().finish(status),
+                Event::Exited(_, status) => pane.session.borrow_mut().finish(status),
                 Event::Configuration(_) => unreachable!(),
+            }
+        }
+    }
+    fn pane_view(
+        &self,
+        tree: &PaneTree,
+        focused: u64,
+        show_focus: bool,
+        metrics: Metrics,
+    ) -> BoxedWidget {
+        match tree {
+            PaneTree::Pane(pane) => {
+                let focus = self.clone();
+                let pane_id = pane.id;
+                Box::new(TerminalScreen {
+                    session: pane.session.clone(),
+                    selection: pane.selection.clone(),
+                    revision: self.revision.clone(),
+                    metrics,
+                    ctrl_held: self.ctrl_held.clone(),
+                    open_target: {
+                        let state = self.clone();
+                        Some(Rc::new(move |target| state.open_target(target)))
+                    },
+                    focused: show_focus && pane_id == focused,
+                    on_focus: Some(Rc::new(move || focus.focus_pane(pane_id))),
+                })
+            }
+            PaneTree::Split {
+                orientation,
+                ratio,
+                first,
+                second,
+            } => {
+                let slot = |weight, child| {
+                    view(
+                        Style {
+                            flex_grow: weight,
+                            flex_basis: Dimension::Length(0.0),
+                            min_size: creamui_core::layout::Size {
+                                width: Dimension::Length(0.0),
+                                height: Dimension::Length(0.0),
+                            },
+                            ..Default::default()
+                        },
+                        vec![child],
+                    )
+                };
+                let style = match orientation {
+                    SplitOrientation::Horizontal => row(1.0),
+                    SplitOrientation::Vertical => column(1.0),
+                };
+                view(
+                    Style {
+                        flex_grow: 1.0,
+                        flex_basis: Dimension::Length(0.0),
+                        min_size: creamui_core::layout::Size {
+                            width: Dimension::Length(0.0),
+                            height: Dimension::Length(0.0),
+                        },
+                        ..style
+                    },
+                    vec![
+                        slot(*ratio, self.pane_view(first, focused, show_focus, metrics)),
+                        slot(
+                            1.0 - ratio,
+                            self.pane_view(second, focused, show_focus, metrics),
+                        ),
+                    ],
+                )
             }
         }
     }
@@ -1182,22 +1553,18 @@ impl State {
         let metrics = self.metrics.get();
         let (rows, cols) = metrics.size(size.width, screen_height);
         for tab in &tabs {
-            let result = tab.session.borrow_mut().resize(rows, cols);
-            self.report(result);
+            for result in tab.panes.resize_sessions(rows, cols) {
+                self.report(result);
+            }
         }
         let mut children = vec![self.header(size.width)];
         if let Some(tab) = tabs.get(active) {
-            children.push(Box::new(TerminalScreen {
-                session: tab.session.clone(),
-                selection: tab.selection.clone(),
-                revision: self.revision.clone(),
+            children.push(self.pane_view(
+                &tab.panes,
+                tab.active_pane.get(),
+                tab.all_panes().len() > 1,
                 metrics,
-                ctrl_held: self.ctrl_held.clone(),
-                open_target: {
-                    let state = self.clone();
-                    Some(Rc::new(move |target| state.open_target(target)))
-                },
-            }));
+            ));
         } else {
             let retry = self.clone();
             children.push(view(
@@ -1525,6 +1892,51 @@ mod tests {
         WindowDecorations,
     };
     use creamui_theme::{Theme, ThemeProvider};
+
+    #[test]
+    fn panes_split_focus_resize_and_close() {
+        creamui_reactive::with_context_scope(|| {
+            creamui_reactive::provide_context(ThemeProvider::new(Theme::dark()));
+            creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
+            let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+            let state = State::new(
+                crate::terminal::idle_cwd(),
+                crate::terminal::idle_command(),
+                tx,
+            );
+            state.add();
+            let first = state.current().unwrap().session.borrow().id;
+
+            state.dispatch(Action::SplitHorizontal);
+            let tab = state.current().unwrap();
+            assert_eq!(tab.all_panes().len(), 2);
+            let second = tab.session.borrow().id;
+            assert_ne!(second, first);
+
+            state.dispatch(Action::GrowPane);
+            let tab = state.current().unwrap();
+            let PaneTree::Split { ratio, .. } = &tab.panes else {
+                panic!("expected a split pane tree");
+            };
+            assert!(*ratio < 0.5);
+
+            state.dispatch(Action::FocusPreviousPane);
+            assert_eq!(state.current().unwrap().session.borrow().id, first);
+            state.dispatch(Action::SplitVertical);
+            assert_eq!(state.current().unwrap().all_panes().len(), 3);
+            let _tree = state.build(Size {
+                width: 900.0,
+                height: 640.0,
+            });
+
+            state.dispatch(Action::ClosePane);
+            assert_eq!(state.current().unwrap().all_panes().len(), 2);
+            state.dispatch(Action::ClosePane);
+            assert_eq!(state.current().unwrap().all_panes().len(), 1);
+            state.cleanup();
+        });
+    }
+
     #[test]
     fn island_modes_reposition_live_and_all_controls_remain_clickable() {
         use crate::island::{Horizontal, Vertical};
@@ -1900,6 +2312,8 @@ mod tests {
                 metrics: state.metrics.peek(),
                 ctrl_held: state.ctrl_held.clone(),
                 open_target: None,
+                focused: false,
+                on_focus: None,
             };
             creamui_core::Widget::on_scroll(&screen).unwrap()(-40.0);
             let id = tab.session.borrow().id;

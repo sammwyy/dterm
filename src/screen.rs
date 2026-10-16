@@ -157,6 +157,8 @@ pub struct TerminalScreen {
     pub metrics: Metrics,
     pub ctrl_held: Signal<bool>,
     pub open_target: Option<Rc<dyn Fn(String)>>,
+    pub focused: bool,
+    pub on_focus: Option<Rc<dyn Fn()>>,
 }
 impl TerminalScreen {
     fn position(metrics: Metrics, p: Point, screen: &vt100::Screen) -> Position {
@@ -292,6 +294,9 @@ impl Widget for TerminalScreen {
                 }
             }
         }
+        if self.focused {
+            painter.stroke_rect_inside(rect, theme.colors.accent, 1.0, 0.0);
+        }
         painter.pop_clip();
     }
     fn on_drag_start(&self) -> Option<Rc<dyn Fn(Point, Rect)>> {
@@ -300,7 +305,11 @@ impl Widget for TerminalScreen {
         let metrics = self.metrics;
         let ctrl_held = self.ctrl_held.clone();
         let open_target = self.open_target.clone();
+        let on_focus = self.on_focus.clone();
         Some(Rc::new(move |p, _| {
+            if let Some(focus) = &on_focus {
+                focus();
+            }
             let screen = session.borrow();
             let pos = Self::position(metrics, p, screen.parser.screen());
             if ctrl_held.peek() {
@@ -562,6 +571,8 @@ mod tests {
             open_target: Some(Rc::new(move |target| {
                 *callback_target.borrow_mut() = Some(target)
             })),
+            focused: false,
+            on_focus: None,
         };
         Widget::on_drag_start(&screen).unwrap()(
             Point {
@@ -641,6 +652,8 @@ mod tests {
                 metrics,
                 ctrl_held: Signal::new(false),
                 open_target: None,
+                focused: false,
+                on_focus: None,
             };
             let mut gpu = HeadlessGpu::new().ok();
             if let Some(gpu) = &gpu {
@@ -775,6 +788,8 @@ mod tests {
                 },
                 ctrl_held: Signal::new(false),
                 open_target: None,
+                focused: false,
+                on_focus: None,
             };
             for scale in [1.0, 1.25, 1.5, 2.0] {
                 let width = (160.0 * scale) as u32;
