@@ -40,6 +40,7 @@ pub trait Backend {
     /// Directories that hold installed font files. Subdirectories are included.
     fn font_directories() -> Vec<PathBuf>;
     fn open_url(url: &str) -> std::process::Command;
+    fn notification(title: &str, body: &str) -> std::process::Command;
     fn take_startup(pending: &mut Vec<u8>) -> Startup;
     fn is_startup_reply(bytes: &[u8]) -> bool;
     /// ConPTY must be answered before the first resize, or the UI thread blocks.
@@ -108,6 +109,13 @@ pub fn is_executable_file(metadata: &Metadata) -> bool {
 }
 pub fn open_url(url: &str) -> std::process::Command {
     select_backend!(open_url(url))
+}
+pub fn notify(title: &str, body: &str) {
+    if let Ok(mut child) = select_backend!(notification(title, body)).spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 pub fn install_terminal_font(family: &str) {
     fonts::install(family);

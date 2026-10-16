@@ -40,6 +40,11 @@ impl Backend for Unix {
         command.arg(url);
         command
     }
+    fn notification(title: &str, body: &str) -> Command {
+        let mut command = Command::new("notify-send");
+        command.args(["--app-name", "dterm", title, body]);
+        command
+    }
     fn take_startup(pending: &mut Vec<u8>) -> Startup {
         passthrough_startup(pending)
     }

@@ -18,6 +18,8 @@ pub struct Config {
     pub scrollback: usize,
     pub confirm_multiline_paste: bool,
     pub restore_session: bool,
+    pub notify_on_command_completion: bool,
+    pub command_completion_threshold_seconds: u16,
     pub island: crate::island::Config,
     pub shortcuts: BTreeMap<String, String>,
 }
@@ -131,6 +133,8 @@ struct FileConfig {
     scrollback: Option<usize>,
     confirm_multiline_paste: Option<bool>,
     restore_session: Option<bool>,
+    notify_on_command_completion: Option<bool>,
+    command_completion_threshold_seconds: Option<u16>,
     island: crate::island::Config,
     shortcuts: BTreeMap<String, String>,
 }
@@ -161,6 +165,14 @@ impl From<FileConfig> for Config {
         if let Some(restore_session) = file.restore_session {
             config.restore_session = restore_session;
         }
+        if let Some(notify_on_command_completion) = file.notify_on_command_completion {
+            config.notify_on_command_completion = notify_on_command_completion;
+        }
+        if let Some(command_completion_threshold_seconds) =
+            file.command_completion_threshold_seconds
+        {
+            config.command_completion_threshold_seconds = command_completion_threshold_seconds;
+        }
         config.shortcuts.extend(file.shortcuts);
         config.island = file.island;
         config
@@ -177,6 +189,8 @@ impl Default for Config {
             scrollback: crate::terminal::SCROLLBACK,
             confirm_multiline_paste: true,
             restore_session: true,
+            notify_on_command_completion: true,
+            command_completion_threshold_seconds: 10,
             island: crate::island::Config::default(),
             shortcuts: Action::all()
                 .into_iter()
@@ -256,6 +270,9 @@ impl Config {
         }
         if !(30..=100).contains(&self.appearance.opacity) {
             return Err("Window opacity must be between 30 and 100".into());
+        }
+        if !(1..=3_600).contains(&self.command_completion_threshold_seconds) {
+            return Err("Command completion threshold must be between 1 and 3600 seconds".into());
         }
         if self.profile.trim().is_empty() {
             return Err("Choose a terminal profile".into());
@@ -408,7 +425,7 @@ mod tests {
     #[test]
     fn profiles_appearance_and_safety_preferences_merge_and_validate() {
         let config = Config::parse(
-            "profile = 'work'\nscrollback = 0\nconfirm_multiline_paste = false\nrestore_session = false\n\n[appearance]\nfont_size = 17\nligatures = false\nopacity = 87\n\n[profiles.work]\nexecutable = 'ssh'\narguments = ['dev.example']\ninitial_directory = '/tmp'\ntheme = 'dracula'\n\n[profiles.work.environment]\nLANG = 'C.UTF-8'\n",
+            "profile = 'work'\nscrollback = 0\nconfirm_multiline_paste = false\nrestore_session = false\nnotify_on_command_completion = false\ncommand_completion_threshold_seconds = 42\n\n[appearance]\nfont_size = 17\nligatures = false\nopacity = 87\n\n[profiles.work]\nexecutable = 'ssh'\narguments = ['dev.example']\ninitial_directory = '/tmp'\ntheme = 'dracula'\n\n[profiles.work.environment]\nLANG = 'C.UTF-8'\n",
         )
         .unwrap();
         assert_eq!(config.profile, "work");
@@ -420,6 +437,8 @@ mod tests {
         assert_eq!(config.scrollback, 0);
         assert!(!config.confirm_multiline_paste);
         assert!(!config.restore_session);
+        assert!(!config.notify_on_command_completion);
+        assert_eq!(config.command_completion_threshold_seconds, 42);
         assert_eq!(config.appearance.font_size, 17);
         assert!(!config.appearance.ligatures);
         assert_eq!(config.appearance.opacity, 87);
@@ -433,6 +452,7 @@ mod tests {
         assert!(Config::parse("profile='missing'").is_err());
         assert!(Config::parse("[appearance]\nfont_size=7").is_err());
         assert!(Config::parse("[appearance]\nopacity=29").is_err());
+        assert!(Config::parse("command_completion_threshold_seconds=0").is_err());
         assert!(Config::parse("[profiles.bad]\nexecutable='' ").is_err());
         assert!(Config::parse("[profiles.bad.environment]\n'1BAD'='x'").is_err());
         assert!(Config::parse("scrollback=1000001").is_err());

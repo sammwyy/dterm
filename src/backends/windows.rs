@@ -78,6 +78,11 @@ impl Backend for Windows {
         command.args(["/C", "start", "", url]);
         command
     }
+    fn notification(title: &str, body: &str) -> Command {
+        let mut command = Command::new("msg");
+        command.args(["*", &format!("{title}: {body}")]);
+        command
+    }
     fn take_startup(pending: &mut Vec<u8>) -> Startup {
         if let Some(pos) = pending.windows(4).position(|window| window == b"\x1b[6n") {
             let rest = pending.split_off(pos + 4);

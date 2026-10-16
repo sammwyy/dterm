@@ -58,6 +58,19 @@ impl Backend for MacOs {
         command.arg(url);
         command
     }
+    fn notification(title: &str, body: &str) -> Command {
+        let escape = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut command = Command::new("osascript");
+        command.args([
+            "-e",
+            &format!(
+                "display notification \"{}\" with title \"{}\"",
+                escape(body),
+                escape(title)
+            ),
+        ]);
+        command
+    }
     fn take_startup(pending: &mut Vec<u8>) -> Startup {
         passthrough_startup(pending)
     }

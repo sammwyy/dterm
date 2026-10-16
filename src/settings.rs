@@ -462,6 +462,8 @@ impl State {
         let scrollback = self.clone();
         let paste = self.clone();
         let restore = self.clone();
+        let notifications = self.clone();
+        let notification_threshold = self.clone();
         settings_group(
             "Behavior",
             vec![
@@ -499,6 +501,40 @@ impl State {
                             .config
                             .update(|config| config.restore_session = !config.restore_session)
                     })),
+                ),
+                setting_row(
+                    Symbol::Controls,
+                    "Notify when commands finish",
+                    "Only when the window is unfocused and the command exceeded the threshold.",
+                    Box::new(Switch::new(
+                        config.notify_on_command_completion,
+                        move || {
+                            notifications.config.update(|config| {
+                                config.notify_on_command_completion =
+                                    !config.notify_on_command_completion
+                            })
+                        },
+                    )),
+                ),
+                setting_row(
+                    Symbol::Display,
+                    "Command notification threshold",
+                    "Seconds a command must run before completion is announced.",
+                    Box::new(
+                        TextInput::new(
+                            config.command_completion_threshold_seconds.to_string(),
+                            move |value| {
+                                if let Ok(seconds) = value.parse() {
+                                    notification_threshold.config.update(|config| {
+                                        config.command_completion_threshold_seconds = seconds
+                                    });
+                                }
+                            },
+                        )
+                        .width(72.0)
+                        .height(34.0)
+                        .font_size(13.0),
+                    ),
                 ),
             ],
         )
@@ -825,18 +861,18 @@ mod tests {
                     modifiers: Default::default(),
                 };
                 scene
-                    .on_key_at(14)
+                    .on_key_at(16)
                     .expect("vertical orientation is keyboard accessible")(enter);
                 assert_eq!(
                     state.config.peek().island.orientation,
                     Orientation::Vertical
                 );
                 scene
-                    .on_key_at(12)
+                    .on_key_at(14)
                     .expect("enabled switch is keyboard accessible")(enter);
                 assert!(!state.config.peek().island.enabled);
                 scene
-                    .on_key_at(17)
+                    .on_key_at(19)
                     .expect("restore defaults is keyboard accessible")(enter);
                 assert_eq!(state.config.peek(), Config::default());
             });

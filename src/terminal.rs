@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, SyncSender},
     thread,
+    time::{Duration, Instant},
 };
 
 pub const SCROLLBACK: usize = 10_000;
@@ -115,11 +116,32 @@ pub enum Event {
     Configuration(Result<crate::config::Config, String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellMarker {
+    PromptStart,
+    PromptEnd,
+    CommandOutputStart,
+    CommandFinished(Option<i32>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandBoundary {
+    pub marker: ShellMarker,
+    pub line: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompletedCommand {
+    pub status: Option<i32>,
+    pub duration: Duration,
+}
+
 #[derive(Default)]
 pub struct Callbacks {
     pub title: String,
     pub cwd: Option<PathBuf>,
     pub replies: Vec<u8>,
+    pub boundaries: Vec<CommandBoundary>,
 }
 impl vt100::Callbacks for Callbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
@@ -159,11 +181,36 @@ impl vt100::Callbacks for Callbacks {
         };
         self.replies.extend_from_slice(reply.as_bytes());
     }
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
         if let [b"7", value] = params {
             self.cwd = parse_osc7(value);
         }
+        if let Some(marker) = parse_shell_marker(params) {
+            let mut history = screen.clone();
+            history.set_scrollback(usize::MAX);
+            self.boundaries.push(CommandBoundary {
+                marker,
+                line: history.scrollback() + screen.cursor_position().0 as usize,
+            });
+        }
     }
+}
+
+fn parse_shell_marker(params: &[&[u8]]) -> Option<ShellMarker> {
+    let [b"133", marker, rest @ ..] = params else {
+        return None;
+    };
+    Some(match *marker {
+        b"A" => ShellMarker::PromptStart,
+        b"B" => ShellMarker::PromptEnd,
+        b"C" => ShellMarker::CommandOutputStart,
+        b"D" => ShellMarker::CommandFinished(
+            rest.first()
+                .and_then(|status| std::str::from_utf8(status).ok())
+                .and_then(|status| status.parse().ok()),
+        ),
+        _ => return None,
+    })
 }
 
 fn parse_osc7(value: &[u8]) -> Option<PathBuf> {
@@ -202,6 +249,9 @@ pub struct Session {
     pub pending_paste: Option<String>,
     pub palette: Palette,
     pub manual_title: Option<String>,
+    pub command_boundaries: Vec<CommandBoundary>,
+    completed_commands: Vec<CompletedCommand>,
+    command_started: Option<Instant>,
     master: Box<dyn MasterPty + Send>,
     input: Option<SyncSender<Vec<u8>>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -372,6 +422,9 @@ impl Session {
             pending_paste: None,
             palette: Palette::default(),
             manual_title: None,
+            command_boundaries: Vec::new(),
+            completed_commands: Vec::new(),
+            command_started: None,
             master: pair.master,
             input: Some(input),
             killer,
@@ -382,12 +435,63 @@ impl Session {
         if let Some(cwd) = self.parser.callbacks_mut().cwd.take() {
             self.cwd = cwd;
         }
+        let boundaries = std::mem::take(&mut self.parser.callbacks_mut().boundaries);
+        for boundary in boundaries {
+            self.record_boundary(boundary);
+        }
         self.refresh_mode();
         let replies = std::mem::take(&mut self.parser.callbacks_mut().replies);
         if !replies.is_empty() {
             self.write(replies)?;
         }
         Ok(())
+    }
+    fn record_boundary(&mut self, boundary: CommandBoundary) {
+        match boundary.marker {
+            ShellMarker::CommandOutputStart => self.command_started = Some(Instant::now()),
+            ShellMarker::CommandFinished(status) => {
+                if let Some(started) = self.command_started.take() {
+                    self.completed_commands.push(CompletedCommand {
+                        status,
+                        duration: started.elapsed(),
+                    });
+                    if self.completed_commands.len() > 64 {
+                        self.completed_commands.drain(..32);
+                    }
+                }
+            }
+            ShellMarker::PromptStart | ShellMarker::PromptEnd => {}
+        }
+        self.command_boundaries.push(boundary);
+        if self.command_boundaries.len() > 2_048 {
+            self.command_boundaries.drain(..1_024);
+        }
+    }
+    pub fn take_completed_commands(&mut self) -> Vec<CompletedCommand> {
+        std::mem::take(&mut self.completed_commands)
+    }
+    pub fn navigate_command(&mut self, previous: bool) -> bool {
+        let mut snapshot = self.parser.screen().clone();
+        snapshot.set_scrollback(usize::MAX);
+        let history = snapshot.scrollback();
+        let top = history.saturating_sub(self.parser.screen().scrollback());
+        let target = if previous {
+            self.command_boundaries
+                .iter()
+                .rev()
+                .find(|boundary| boundary.line < top)
+        } else {
+            self.command_boundaries
+                .iter()
+                .find(|boundary| boundary.line > top)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.parser
+            .screen_mut()
+            .set_scrollback(history.saturating_sub(target.line));
+        true
     }
     pub fn write(&self, bytes: Vec<u8>) -> Result<()> {
         if let Some(input) = &self.input {
@@ -472,6 +576,52 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_markers_track_commands_and_navigate_boundaries() {
+        let (tx, _rx) = mpsc::sync_channel(128);
+        let mut session = Session::spawn(
+            1,
+            &crate::terminal::idle_cwd(),
+            &crate::terminal::idle_command(),
+            tx,
+        )
+        .unwrap();
+        session.resize(2, 20).unwrap();
+        session
+            .process(b"\x1b]133;A\x07$ \x1b]133;B\x07echo done\x1b]133;C\x07done\r\n")
+            .unwrap();
+        assert!(matches!(
+            session.command_boundaries.as_slice(),
+            [
+                CommandBoundary {
+                    marker: ShellMarker::PromptStart,
+                    ..
+                },
+                CommandBoundary {
+                    marker: ShellMarker::PromptEnd,
+                    ..
+                },
+                CommandBoundary {
+                    marker: ShellMarker::CommandOutputStart,
+                    ..
+                }
+            ]
+        ));
+        session.command_started = Some(Instant::now() - Duration::from_secs(12));
+        session.process(b"\x1b]133;D;0\x07").unwrap();
+        let completed = session.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].status, Some(0));
+        assert!(completed[0].duration >= Duration::from_secs(12));
+
+        session
+            .process(b"\x1b]133;A\x07one\r\ntwo\r\nthree\r\nfour\r\nfive")
+            .unwrap();
+        assert!(session.navigate_command(true));
+        assert!(session.parser.screen().scrollback() > 0);
+    }
+
     #[test]
     fn vt_state_title_queries_and_alternate_screen_survive_chunked_output() {
         let mut parser = vt100::Parser::new_with_callbacks(4, 20, 20, Callbacks::default());

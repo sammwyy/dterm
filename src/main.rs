@@ -81,12 +81,14 @@ fn run_terminal(cwd: std::path::PathBuf, command: Vec<String>) {
         .on_started(move |app| {
             let keys = state.clone();
             let build = state.clone();
+            let focus = state.clone();
             app.append_window(
                 opts,
                 ui::CLEAR,
                 move |handle| {
                     handle.set_compositor_integration(Some(CompositorIntegrationRequest::Hybrid));
                     handle.on_keyboard_input(move |event, modifiers| keys.key(event, modifiers));
+                    handle.on_focus_lost(move || focus.set_window_focused(false));
                     *ready.borrow_mut() = Some(handle);
                 },
                 move |size| build.build(size),

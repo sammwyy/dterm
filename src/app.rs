@@ -249,6 +249,7 @@ pub struct State {
     maximized: Signal<bool>,
     clipboard: Rc<RefCell<Option<arboard::Clipboard>>>,
     ctrl_held: Signal<bool>,
+    window_focused: Signal<bool>,
     session_file: Rc<RefCell<Option<PathBuf>>>,
 }
 impl State {
@@ -274,6 +275,7 @@ impl State {
             maximized: Signal::new(false),
             clipboard: Rc::new(RefCell::new(None)),
             ctrl_held: Signal::new(false),
+            window_focused: Signal::new(true),
             session_file: Rc::new(RefCell::new(None)),
         }
     }
@@ -428,6 +430,7 @@ impl State {
         self.revision.update(|value| *value = value.wrapping_add(1));
     }
     fn focus_pane(&self, id: u64) {
+        self.window_focused.set(true);
         let active = self.active.peek();
         let mut changed = false;
         self.tabs.update(|tabs| {
@@ -637,6 +640,7 @@ impl State {
     }
     pub fn key(&self, event: KeyEvent, m: Modifiers) -> bool {
         self.ctrl_held.set(m.ctrl);
+        self.window_focused.set(true);
         if !event.pressed {
             return true;
         }
@@ -833,6 +837,9 @@ impl State {
     pub fn show_error(&self, message: String) {
         self.error.set(Some(message));
     }
+    pub fn set_window_focused(&self, focused: bool) {
+        self.window_focused.set(focused);
+    }
     fn open_target(&self, target: String) {
         let target = if target.starts_with('/') || target.starts_with("~/") {
             let path = if let Some(rest) = target.strip_prefix("~/") {
@@ -858,6 +865,30 @@ impl State {
                 });
             }
             Err(error) => self.show_error(format!("Couldn't open target: {error}")),
+        }
+    }
+    fn notify_completed_commands(
+        &self,
+        pane: &Pane,
+        completed: Vec<crate::terminal::CompletedCommand>,
+    ) {
+        let config = self.config.peek();
+        let session = pane.session.borrow();
+        let directory = session.cwd.display().to_string();
+        for command in completed.into_iter().filter(|command| {
+            should_notify_for_command(&config, self.window_focused.peek(), command.duration)
+        }) {
+            let status = command.status.map_or_else(
+                || "finished".into(),
+                |status| format!("finished ({status})"),
+            );
+            crate::backends::notify(
+                "Command finished",
+                &format!(
+                    "{status} in {directory} after {}s",
+                    command.duration.as_secs()
+                ),
+            );
         }
     }
     fn dispatch(&self, action: Action) {
@@ -886,6 +917,17 @@ impl State {
             Action::FocusPreviousPane => self.focus_relative_pane(-1),
             Action::GrowPane => self.resize_pane(0.05),
             Action::ShrinkPane => self.resize_pane(-0.05),
+            Action::PreviousCommand | Action::NextCommand => {
+                if let Some(tab) = self.current() {
+                    if tab
+                        .session
+                        .borrow_mut()
+                        .navigate_command(action == Action::PreviousCommand)
+                    {
+                        self.revision.update(|value| *value = value.wrapping_add(1));
+                    }
+                }
+            }
             Action::Settings => open_settings(),
             Action::ScrollUp | Action::ScrollDown => {
                 if let Some(tab) = self.current() {
@@ -1450,13 +1492,19 @@ impl State {
         {
             match event {
                 Event::Output(_, bytes) => {
-                    let previous_cwd = pane.session.borrow().cwd.clone();
-                    let result = pane.session.borrow_mut().process(&bytes);
-                    let cwd_changed = pane.session.borrow().cwd != previous_cwd;
+                    let (result, cwd_changed, completed) = {
+                        let mut session = pane.session.borrow_mut();
+                        let previous_cwd = session.cwd.clone();
+                        let result = session.process(&bytes);
+                        let cwd_changed = session.cwd != previous_cwd;
+                        let completed = session.take_completed_commands();
+                        (result, cwd_changed, completed)
+                    };
                     creamui_reactive::batch(|| {
                         pane.selection.set(None);
                         self.report(result);
                     });
+                    self.notify_completed_commands(&pane, completed);
                     if cwd_changed {
                         self.persist_session();
                     }
@@ -1827,6 +1875,17 @@ fn with_opacity(color: Color, opacity: u8) -> Color {
     )
 }
 
+fn should_notify_for_command(
+    config: &Config,
+    window_focused: bool,
+    duration: std::time::Duration,
+) -> bool {
+    config.notify_on_command_completion
+        && !window_focused
+        && duration
+            >= std::time::Duration::from_secs(config.command_completion_threshold_seconds.into())
+}
+
 fn search_key(key: &Key) -> Option<creamui_core::Key> {
     use creamui_core::Key as K;
     Some(match key {
@@ -1908,6 +1967,33 @@ mod tests {
         WindowDecorations,
     };
     use creamui_theme::{Theme, ThemeProvider};
+
+    #[test]
+    fn completion_notifications_require_an_unfocused_long_running_command() {
+        let config = Config::default();
+        assert!(!should_notify_for_command(
+            &config,
+            true,
+            std::time::Duration::from_secs(60),
+        ));
+        assert!(!should_notify_for_command(
+            &config,
+            false,
+            std::time::Duration::from_secs(9),
+        ));
+        assert!(should_notify_for_command(
+            &config,
+            false,
+            std::time::Duration::from_secs(10),
+        ));
+        let mut disabled = config;
+        disabled.notify_on_command_completion = false;
+        assert!(!should_notify_for_command(
+            &disabled,
+            false,
+            std::time::Duration::from_secs(60),
+        ));
+    }
 
     #[test]
     fn panes_split_focus_resize_and_close() {
