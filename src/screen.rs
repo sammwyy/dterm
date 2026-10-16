@@ -1,4 +1,4 @@
-use crate::{terminal::Session, ui::CLEAR};
+use crate::{config::TerminalTheme, terminal::Session, ui::CLEAR};
 use creamui_core::{layout, CursorIcon, Painter, Point, Rect, TextAlign, Widget};
 use creamui_reactive::Signal;
 use creamui_theme::{use_theme, Color, ColorScheme};
@@ -14,10 +14,10 @@ pub struct Metrics {
     pub font_size: f32,
 }
 impl Metrics {
-    pub fn load(family: &str) -> Self {
+    pub fn load(family: &str, font_size: u8) -> Self {
         use creamui_fonts::{FontWeight, LayoutSettings};
         crate::backends::install_terminal_font(family);
-        let font_size = 14.0;
+        let font_size = font_size as f32;
         let face = creamui_fonts::resolve(FONT, FontWeight::Regular);
         let shaped =
             creamui_fonts::cached_layout(&face, "M", font_size, &LayoutSettings::default());
@@ -141,7 +141,11 @@ impl Widget for TerminalScreen {
         let screen = session.parser.screen();
         let selection = self.selection.get();
         let m = self.metrics;
+        let terminal = terminal_colors(session.theme, theme.colors);
         painter.push_clip(rect);
+        if session.theme != TerminalTheme::Default {
+            painter.fill_rect(rect, terminal.background, 0.0);
+        }
         let (rows, cols) = screen.size();
         let scale = painter.scale_factor();
         let selected = |row, col| selection.is_some_and(|s| s.contains(row, col));
@@ -153,12 +157,12 @@ impl Widget for TerminalScreen {
                 let background = |col| {
                     screen
                         .cell(row, col)
-                        .map(|cell| cell_colors(cell, selected(row, col), theme.colors).1)
-                        .unwrap_or(CLEAR)
+                        .map(|cell| cell_colors(cell, selected(row, col), theme.colors, terminal).1)
+                        .unwrap_or(terminal.default_background)
                 };
                 let background = |col| match session.search.highlight(screen, row, col) {
                     Some(true) => theme.colors.accent,
-                    Some(false) => theme.colors.surface.mix(theme.colors.accent, 0.35),
+                    Some(false) => terminal.background.mix(theme.colors.accent, 0.35),
                     None => background(col),
                 };
                 let bg = background(start);
@@ -180,9 +184,9 @@ impl Widget for TerminalScreen {
                 if cell.is_wide_continuation() {
                     continue;
                 }
-                let (mut fg, _) = cell_colors(cell, selected(row, col), theme.colors);
+                let (mut fg, _) = cell_colors(cell, selected(row, col), theme.colors, terminal);
                 if session.search.highlight(screen, row, col) == Some(true) {
-                    fg = theme.colors.surface;
+                    fg = terminal.background;
                 }
                 let span = if cell.is_wide() { 2 } else { 1 };
                 let cell_rect = m.cell_rect(rect, row, col, (col + span).min(cols), scale);
@@ -285,50 +289,153 @@ impl Widget for TerminalScreen {
         }))
     }
 }
-fn cell_colors(cell: &vt100::Cell, selected: bool, colors: ColorScheme) -> (Color, Color) {
-    let mut fg = color(cell.fgcolor(), colors.text_primary);
-    let mut bg = color(cell.bgcolor(), CLEAR);
+#[derive(Clone, Copy)]
+struct TerminalColors {
+    foreground: Color,
+    background: Color,
+    default_background: Color,
+    ansi: [Color; 16],
+}
+
+fn terminal_colors(theme: TerminalTheme, colors: ColorScheme) -> TerminalColors {
+    const DEFAULT_ANSI: [[u8; 3]; 16] = [
+        [40, 44, 52],
+        [205, 80, 86],
+        [100, 165, 100],
+        [194, 157, 73],
+        [80, 135, 204],
+        [163, 108, 190],
+        [70, 157, 170],
+        [205, 210, 218],
+        [93, 100, 113],
+        [238, 111, 118],
+        [140, 199, 124],
+        [230, 194, 112],
+        [124, 174, 232],
+        [199, 147, 225],
+        [118, 199, 207],
+        [239, 241, 245],
+    ];
+    const DRACULA: [[u8; 3]; 16] = [
+        [33, 34, 44],
+        [255, 85, 85],
+        [80, 250, 123],
+        [241, 250, 140],
+        [189, 147, 249],
+        [255, 121, 198],
+        [139, 233, 253],
+        [248, 248, 242],
+        [98, 114, 164],
+        [255, 110, 110],
+        [105, 255, 148],
+        [255, 255, 165],
+        [214, 172, 255],
+        [255, 146, 218],
+        [164, 255, 255],
+        [255, 255, 255],
+    ];
+    const SOLARIZED_DARK: [[u8; 3]; 16] = [
+        [7, 54, 66],
+        [220, 50, 47],
+        [133, 153, 0],
+        [181, 137, 0],
+        [38, 139, 210],
+        [211, 54, 130],
+        [42, 161, 152],
+        [238, 232, 213],
+        [0, 43, 54],
+        [203, 75, 22],
+        [88, 110, 117],
+        [101, 123, 131],
+        [131, 148, 150],
+        [108, 113, 196],
+        [147, 161, 161],
+        [253, 246, 227],
+    ];
+    const SOLARIZED_LIGHT: [[u8; 3]; 16] = [
+        [238, 232, 213],
+        [220, 50, 47],
+        [133, 153, 0],
+        [181, 137, 0],
+        [38, 139, 210],
+        [211, 54, 130],
+        [42, 161, 152],
+        [7, 54, 66],
+        [253, 246, 227],
+        [203, 75, 22],
+        [147, 161, 161],
+        [131, 148, 150],
+        [101, 123, 131],
+        [108, 113, 196],
+        [88, 110, 117],
+        [0, 43, 54],
+    ];
+    let (foreground, background, ansi) = match theme {
+        TerminalTheme::Default => (colors.text_primary, colors.surface, DEFAULT_ANSI),
+        TerminalTheme::Dracula => (Color::rgb(248, 248, 242), Color::rgb(40, 42, 54), DRACULA),
+        TerminalTheme::SolarizedDark => (
+            Color::rgb(131, 148, 150),
+            Color::rgb(0, 43, 54),
+            SOLARIZED_DARK,
+        ),
+        TerminalTheme::SolarizedLight => (
+            Color::rgb(101, 123, 131),
+            Color::rgb(253, 246, 227),
+            SOLARIZED_LIGHT,
+        ),
+    };
+    TerminalColors {
+        foreground,
+        background,
+        default_background: if theme == TerminalTheme::Default {
+            CLEAR
+        } else {
+            background
+        },
+        ansi: ansi.map(|[r, g, b]| Color::rgb(r, g, b)),
+    }
+}
+
+fn cell_colors(
+    cell: &vt100::Cell,
+    selected: bool,
+    colors: ColorScheme,
+    terminal: TerminalColors,
+) -> (Color, Color) {
+    let mut fg = color_with_palette(cell.fgcolor(), terminal.foreground, terminal.ansi);
+    let mut bg = color_with_palette(cell.bgcolor(), terminal.default_background, terminal.ansi);
     if cell.inverse() {
         std::mem::swap(&mut fg, &mut bg);
         if fg == CLEAR {
-            fg = colors.surface;
+            fg = terminal.background;
         }
     }
     if cell.dim() {
-        fg = fg.mix(colors.surface, 0.45);
+        fg = fg.mix(terminal.background, 0.45);
     }
     if selected {
         bg = colors.selection_background;
-        fg = colors.text_primary;
+        fg = terminal.foreground;
     }
     (fg, bg)
 }
 
+#[cfg(test)]
 pub fn color(value: vt100::Color, default: Color) -> Color {
+    color_with_palette(
+        value,
+        default,
+        terminal_colors(TerminalTheme::Default, ColorScheme::dark()).ansi,
+    )
+}
+
+fn color_with_palette(value: vt100::Color, default: Color, ansi: [Color; 16]) -> Color {
     match value {
         vt100::Color::Default => default,
         vt100::Color::Rgb(r, g, b) => Color::rgb(r, g, b),
         vt100::Color::Idx(n) => {
-            const ANSI: [[u8; 3]; 16] = [
-                [40, 44, 52],
-                [205, 80, 86],
-                [100, 165, 100],
-                [194, 157, 73],
-                [80, 135, 204],
-                [163, 108, 190],
-                [70, 157, 170],
-                [205, 210, 218],
-                [93, 100, 113],
-                [238, 111, 118],
-                [140, 199, 124],
-                [230, 194, 112],
-                [124, 174, 232],
-                [199, 147, 225],
-                [118, 199, 207],
-                [239, 241, 245],
-            ];
             let rgb = if n < 16 {
-                ANSI[n as usize]
+                return ansi[n as usize];
             } else if n < 232 {
                 let n = n - 16;
                 let v = |x: u8| if x == 0 { 0 } else { 55 + 40 * x };
@@ -344,6 +451,22 @@ pub fn color(value: vt100::Color, default: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_themes_override_ansi_and_default_colors() {
+        let base = ColorScheme::dark();
+        let dracula = terminal_colors(TerminalTheme::Dracula, base);
+        let solarized = terminal_colors(TerminalTheme::SolarizedLight, base);
+        assert_eq!(dracula.background, Color::rgb(40, 42, 54));
+        assert_eq!(
+            color_with_palette(vt100::Color::Idx(1), dracula.foreground, dracula.ansi),
+            Color::rgb(255, 85, 85)
+        );
+        assert_eq!(solarized.background, Color::rgb(253, 246, 227));
+        assert_eq!(
+            color_with_palette(vt100::Color::Default, solarized.foreground, solarized.ansi),
+            solarized.foreground
+        );
+    }
     #[test]
     fn terminal_bars_and_backgrounds_tile_in_cpu_and_gpu_renderers() {
         use creamui_render::{Damage, HeadlessGpu, Rasterizer, SceneRecorder};

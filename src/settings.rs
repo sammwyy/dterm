@@ -1,6 +1,6 @@
 use crate::{
     chrome,
-    config::Config,
+    config::{Config, TerminalTheme},
     island::{Horizontal, Orientation, Vertical},
     shortcuts::{Action, Binding},
     ui::*,
@@ -42,6 +42,7 @@ pub struct State {
     island_horizontal: SelectController,
     island_vertical: SelectController,
     font: SelectController,
+    terminal_theme: SelectController,
 }
 impl State {
     pub fn new() -> Self {
@@ -62,6 +63,7 @@ impl State {
             island_horizontal: SelectController::new(1),
             island_vertical: SelectController::new(2),
             font: SelectController::new(0),
+            terminal_theme: SelectController::new(0),
         }
     }
     fn save(&self) {
@@ -210,7 +212,10 @@ impl State {
         view(
             column(24.0),
             vec![
-                heading("General", "Shell, font and floating controls."),
+                heading(
+                    "General",
+                    "Shell, terminal appearance and floating controls.",
+                ),
                 settings_group(
                     "Shell",
                     vec![setting_row(
@@ -219,7 +224,12 @@ impl State {
                         "For new terminal sessions.",
                         Box::new(
                             TextInput::new(self.config.get().shell, move |shell| {
-                                state.config.update(|c| c.shell = shell)
+                                state.config.update(|config| {
+                                    config.shell = shell.clone();
+                                    if let Some(profile) = config.profiles.get_mut("default") {
+                                        profile.executable = shell;
+                                    }
+                                })
                             })
                             .placeholder(crate::config::default_shell())
                             .width(160.0)
@@ -234,13 +244,15 @@ impl State {
                     )],
                 ),
                 self.font_settings(),
+                self.behavior_settings(),
                 self.island_settings(),
                 self.actions(Page::General),
             ],
         )
     }
     fn font_settings(&self) -> BoxedWidget {
-        let selected = self.config.get().font;
+        let config = self.config.get();
+        let selected = config.font.clone();
         let choices = crate::backends::font_choices(&selected);
         let labels: Vec<&str> = choices.iter().map(String::as_str).collect();
         let index = labels
@@ -250,24 +262,104 @@ impl State {
         sync_select(&self.font, index);
         let state = self.clone();
         let on_choose = choices.clone();
+        let font_size = self.clone();
+        let ligatures = self.clone();
+        let opacity_state = self.clone();
+        let profile = config
+            .active_profile()
+            .expect("loaded configuration has an active profile");
+        let themes = TerminalTheme::ALL;
+        let theme_labels: Vec<&str> = themes.iter().map(|theme| theme.label()).collect();
+        let theme_index = themes
+            .iter()
+            .position(|theme| *theme == profile.theme)
+            .unwrap_or_default();
+        sync_select(&self.terminal_theme, theme_index);
+        let theme_state = self.clone();
         settings_group(
             "Terminal",
-            vec![setting_row(
-                Symbol::Appearance,
-                "Font",
-                "For terminal text.",
-                Box::new(
-                    Select::controlled(&labels, self.font.clone())
-                        .searchable()
-                        .width(220.0)
-                        .height(34.0)
-                        .on_select(move |index| {
-                            if let Some(name) = on_choose.get(index) {
-                                state.config.update(|config| config.font = name.clone());
-                            }
-                        }),
+            vec![
+                setting_row(
+                    Symbol::Appearance,
+                    "Font",
+                    "For terminal text.",
+                    Box::new(
+                        Select::controlled(&labels, self.font.clone())
+                            .searchable()
+                            .width(220.0)
+                            .height(34.0)
+                            .on_select(move |index| {
+                                if let Some(name) = on_choose.get(index) {
+                                    state.config.update(|config| config.font = name.clone());
+                                }
+                            }),
+                    ),
                 ),
-            )],
+                setting_row(
+                    Symbol::Appearance,
+                    "Font size",
+                    "Between 8 and 72 points.",
+                    Box::new(
+                        TextInput::new(config.appearance.font_size.to_string(), move |value| {
+                            if let Ok(size) = value.parse() {
+                                font_size
+                                    .config
+                                    .update(|config| config.appearance.font_size = size);
+                            }
+                        })
+                        .width(72.0)
+                        .height(34.0)
+                        .font_size(13.0),
+                    ),
+                ),
+                setting_row(
+                    Symbol::Appearance,
+                    "Ligatures",
+                    "Use programming-font ligatures when available.",
+                    Box::new(Switch::new(config.appearance.ligatures, move || {
+                        ligatures.config.update(|config| {
+                            config.appearance.ligatures = !config.appearance.ligatures
+                        })
+                    })),
+                ),
+                setting_row(
+                    Symbol::Display,
+                    "Window opacity",
+                    "Between 30 and 100 percent.",
+                    Box::new(
+                        TextInput::new(config.appearance.opacity.to_string(), move |value| {
+                            if let Ok(opacity) = value.parse() {
+                                opacity_state
+                                    .config
+                                    .update(|config| config.appearance.opacity = opacity);
+                            }
+                        })
+                        .width(72.0)
+                        .height(34.0)
+                        .font_size(13.0),
+                    ),
+                ),
+                setting_row(
+                    Symbol::Sliders,
+                    "Color theme",
+                    "For new terminal sessions in the active profile.",
+                    Box::new(
+                        Select::controlled(&theme_labels, self.terminal_theme.clone())
+                            .width(180.0)
+                            .height(34.0)
+                            .on_select(move |index| {
+                                if let Some(theme) = themes.get(index).copied() {
+                                    theme_state.config.update(|config| {
+                                        let name = config.profile.clone();
+                                        if let Some(profile) = config.profiles.get_mut(&name) {
+                                            profile.theme = theme;
+                                        }
+                                    });
+                                }
+                            }),
+                    ),
+                ),
+            ],
         )
     }
     fn island_settings(&self) -> BoxedWidget {
@@ -361,6 +453,52 @@ impl State {
                                 .update(|c| c.island.vertical = vertical_values[index])
                         }),
                     ),
+                ),
+            ],
+        )
+    }
+    fn behavior_settings(&self) -> BoxedWidget {
+        let config = self.config.get();
+        let scrollback = self.clone();
+        let paste = self.clone();
+        let restore = self.clone();
+        settings_group(
+            "Behavior",
+            vec![
+                setting_row(
+                    Symbol::Grid,
+                    "Scrollback lines",
+                    "0 disables retained history; new sessions use this limit.",
+                    Box::new(
+                        TextInput::new(config.scrollback.to_string(), move |value| {
+                            if let Ok(lines) = value.parse() {
+                                scrollback.config.update(|config| config.scrollback = lines);
+                            }
+                        })
+                        .width(90.0)
+                        .height(34.0)
+                        .font_size(13.0),
+                    ),
+                ),
+                setting_row(
+                    Symbol::Keyboard,
+                    "Confirm multi-line paste",
+                    "Ask before sending more than one line to a terminal.",
+                    Box::new(Switch::new(config.confirm_multiline_paste, move || {
+                        paste.config.update(|config| {
+                            config.confirm_multiline_paste = !config.confirm_multiline_paste
+                        })
+                    })),
+                ),
+                setting_row(
+                    Symbol::Folder,
+                    "Restore previous session",
+                    "Reopen saved tabs and their working directories at startup.",
+                    Box::new(Switch::new(config.restore_session, move || {
+                        restore
+                            .config
+                            .update(|config| config.restore_session = !config.restore_session)
+                    })),
                 ),
             ],
         )
@@ -499,6 +637,12 @@ impl State {
                     if page == Page::General {
                         c.shell = Config::default().shell;
                         c.font = Config::default().font;
+                        c.profile = Config::default().profile;
+                        c.profiles = Config::default().profiles;
+                        c.appearance = Config::default().appearance;
+                        c.scrollback = Config::default().scrollback;
+                        c.confirm_multiline_paste = Config::default().confirm_multiline_paste;
+                        c.restore_session = Config::default().restore_session;
                         c.island = Config::default().island;
                     } else {
                         c.shortcuts = Config::default().shortcuts
@@ -668,32 +812,31 @@ mod tests {
                     }
                 }
                 state.scroll.set(0.0);
-                // Tall enough that the font row does not push Restore defaults
-                // out of the focus order.
+                // Tall enough to keep the terminal controls and Restore defaults in focus order.
                 let size = Size {
                     width: 720.0,
-                    height: 820.0,
+                    height: 1400.0,
                 };
                 let mut recorder = SceneRecorder::new();
-                recorder.begin(720, 820, 1.0, CLEAR, theme.colors);
+                recorder.begin(720, 1400, 1.0, CLEAR, theme.colors);
                 let scene = Renderer::new().render(state.build(size), size, &mut recorder);
                 let enter = creamui_core::KeyInput {
                     key: creamui_core::Key::Enter,
                     modifiers: Default::default(),
                 };
                 scene
-                    .on_key_at(7)
+                    .on_key_at(14)
                     .expect("vertical orientation is keyboard accessible")(enter);
                 assert_eq!(
                     state.config.peek().island.orientation,
                     Orientation::Vertical
                 );
                 scene
-                    .on_key_at(5)
+                    .on_key_at(12)
                     .expect("enabled switch is keyboard accessible")(enter);
                 assert!(!state.config.peek().island.enabled);
                 scene
-                    .on_key_at(10)
+                    .on_key_at(17)
                     .expect("restore defaults is keyboard accessible")(enter);
                 assert_eq!(state.config.peek(), Config::default());
             });

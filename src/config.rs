@@ -12,25 +12,154 @@ use std::{
 pub struct Config {
     pub shell: String,
     pub font: String,
+    pub profile: String,
+    pub profiles: BTreeMap<String, Profile>,
+    pub appearance: Appearance,
+    pub scrollback: usize,
+    pub confirm_multiline_paste: bool,
+    pub restore_session: bool,
     pub island: crate::island::Config,
     pub shortcuts: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Profile {
+    pub executable: String,
+    pub arguments: Vec<String>,
+    pub initial_directory: Option<PathBuf>,
+    pub environment: BTreeMap<String, String>,
+    pub theme: TerminalTheme,
+}
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            executable: default_shell().into(),
+            arguments: Vec::new(),
+            initial_directory: None,
+            environment: BTreeMap::new(),
+            theme: TerminalTheme::Default,
+        }
+    }
+}
+impl Profile {
+    pub fn command(&self) -> Vec<String> {
+        let mut command = Vec::with_capacity(self.arguments.len() + 1);
+        command.push(self.executable.clone());
+        command.extend(self.arguments.clone());
+        command
+    }
+
+    fn validate(&self, name: &str) -> Result<(), String> {
+        if self.executable.trim().is_empty() {
+            return Err(format!("Profile {name:?} needs an executable"));
+        }
+        if self.executable.contains('\0')
+            || self
+                .arguments
+                .iter()
+                .any(|argument| argument.contains('\0'))
+        {
+            return Err(format!("Profile {name:?} contains an invalid command"));
+        }
+        for (key, value) in &self.environment {
+            let valid_name = !key.is_empty()
+                && key.bytes().enumerate().all(|(index, byte)| {
+                    byte == b'_' || byte.is_ascii_alphabetic() || index > 0 && byte.is_ascii_digit()
+                });
+            if !valid_name || key.contains('=') || value.contains('\0') {
+                return Err(format!(
+                    "Profile {name:?} has an invalid environment variable {key:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalTheme {
+    #[default]
+    Default,
+    Dracula,
+    SolarizedDark,
+    SolarizedLight,
+}
+impl TerminalTheme {
+    pub const ALL: [Self; 4] = [
+        Self::Default,
+        Self::Dracula,
+        Self::SolarizedDark,
+        Self::SolarizedLight,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Dracula => "Dracula",
+            Self::SolarizedDark => "Solarized Dark",
+            Self::SolarizedLight => "Solarized Light",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Appearance {
+    pub font_size: u8,
+    pub ligatures: bool,
+    pub opacity: u8,
+}
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            font_size: 14,
+            ligatures: true,
+            opacity: 100,
+        }
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     shell: Option<String>,
     font: Option<String>,
+    profile: Option<String>,
+    profiles: BTreeMap<String, Profile>,
+    appearance: Appearance,
+    scrollback: Option<usize>,
+    confirm_multiline_paste: Option<bool>,
+    restore_session: Option<bool>,
     island: crate::island::Config,
     shortcuts: BTreeMap<String, String>,
 }
 impl From<FileConfig> for Config {
     fn from(file: FileConfig) -> Self {
         let mut config = Self::default();
+        let has_default_profile = file.profiles.contains_key("default");
         if let Some(shell) = file.shell {
             config.shell = shell;
         }
         if let Some(font) = file.font {
             config.font = font.trim().to_string();
+        }
+        if let Some(profile) = file.profile {
+            config.profile = profile;
+        }
+        config.profiles.extend(file.profiles);
+        if !has_default_profile {
+            config.profiles.get_mut("default").unwrap().executable = config.shell.clone();
+        }
+        config.appearance = file.appearance;
+        if let Some(scrollback) = file.scrollback {
+            config.scrollback = scrollback;
+        }
+        if let Some(confirm_multiline_paste) = file.confirm_multiline_paste {
+            config.confirm_multiline_paste = confirm_multiline_paste;
+        }
+        if let Some(restore_session) = file.restore_session {
+            config.restore_session = restore_session;
         }
         config.shortcuts.extend(file.shortcuts);
         config.island = file.island;
@@ -42,6 +171,12 @@ impl Default for Config {
         Self {
             shell: default_shell().into(),
             font: default_font(),
+            profile: "default".into(),
+            profiles: BTreeMap::from([("default".into(), Profile::default())]),
+            appearance: Appearance::default(),
+            scrollback: crate::terminal::SCROLLBACK,
+            confirm_multiline_paste: true,
+            restore_session: true,
             island: crate::island::Config::default(),
             shortcuts: Action::all()
                 .into_iter()
@@ -113,6 +248,27 @@ impl Config {
         if self.font.trim().is_empty() {
             return Err("Choose a terminal font".into());
         }
+        if self.scrollback > 1_000_000 {
+            return Err("Scrollback must not exceed 1,000,000 lines".into());
+        }
+        if !(8..=72).contains(&self.appearance.font_size) {
+            return Err("Font size must be between 8 and 72".into());
+        }
+        if !(30..=100).contains(&self.appearance.opacity) {
+            return Err("Window opacity must be between 30 and 100".into());
+        }
+        if self.profile.trim().is_empty() {
+            return Err("Choose a terminal profile".into());
+        }
+        if !self.profiles.contains_key(&self.profile) {
+            return Err(format!("Unknown terminal profile {:?}", self.profile));
+        }
+        for (name, profile) in &self.profiles {
+            if name.trim().is_empty() {
+                return Err("Terminal profile names cannot be empty".into());
+            }
+            profile.validate(name)?;
+        }
         self.bindings().map(|_| ())
     }
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
@@ -138,6 +294,14 @@ impl Config {
     pub fn shell_command(&self) -> Result<Vec<String>, String> {
         resolve_shell(&self.shell, std::env::var_os("PATH").as_deref())
             .map(|path| vec![path.to_string_lossy().into_owned()])
+    }
+    pub fn active_profile(&self) -> Result<&Profile, String> {
+        self.profiles
+            .get(&self.profile)
+            .ok_or_else(|| format!("Unknown terminal profile {:?}", self.profile))
+    }
+    pub fn profile_command(&self) -> Result<Vec<String>, String> {
+        self.active_profile().map(Profile::command)
     }
 }
 pub fn path() -> PathBuf {
@@ -235,6 +399,38 @@ mod tests {
         assert!(Config::parse("[island]\norientation='diagonal'").is_err());
         assert!(Config::parse("[island]\nvertical='left'").is_err());
         assert!(Config::parse("[island]\nunknown=true").is_err());
+    }
+    #[test]
+    fn profiles_appearance_and_safety_preferences_merge_and_validate() {
+        let config = Config::parse(
+            "profile = 'work'\nscrollback = 0\nconfirm_multiline_paste = false\nrestore_session = false\n\n[appearance]\nfont_size = 17\nligatures = false\nopacity = 87\n\n[profiles.work]\nexecutable = 'ssh'\narguments = ['dev.example']\ninitial_directory = '/tmp'\ntheme = 'dracula'\n\n[profiles.work.environment]\nLANG = 'C.UTF-8'\n",
+        )
+        .unwrap();
+        assert_eq!(config.profile, "work");
+        assert_eq!(config.profile_command().unwrap(), ["ssh", "dev.example"]);
+        assert_eq!(
+            config.active_profile().unwrap().theme,
+            TerminalTheme::Dracula
+        );
+        assert_eq!(config.scrollback, 0);
+        assert!(!config.confirm_multiline_paste);
+        assert!(!config.restore_session);
+        assert_eq!(config.appearance.font_size, 17);
+        assert!(!config.appearance.ligatures);
+        assert_eq!(config.appearance.opacity, 87);
+        assert_eq!(
+            Config::parse("shell='zsh'")
+                .unwrap()
+                .profile_command()
+                .unwrap(),
+            ["zsh"]
+        );
+        assert!(Config::parse("profile='missing'").is_err());
+        assert!(Config::parse("[appearance]\nfont_size=7").is_err());
+        assert!(Config::parse("[appearance]\nopacity=29").is_err());
+        assert!(Config::parse("[profiles.bad]\nexecutable='' ").is_err());
+        assert!(Config::parse("[profiles.bad.environment]\n'1BAD'='x'").is_err());
+        assert!(Config::parse("scrollback=1000001").is_err());
     }
     #[test]
     fn config_roundtrip_and_system_fallback() {

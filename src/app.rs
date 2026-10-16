@@ -4,7 +4,7 @@ use crate::{
     island::{self, Mode, Orientation},
     screen::{Metrics, Selection, TerminalScreen},
     shortcuts::{Action, Binding},
-    terminal::{Event, Session},
+    terminal::{Event, Session, SessionOptions},
     ui::*,
 };
 use creamui_core::{
@@ -68,7 +68,10 @@ impl State {
             bindings: Rc::new(RefCell::new(
                 Config::default().bindings().expect("default shortcuts"),
             )),
-            metrics: Signal::new(Metrics::load(&Config::default().font)),
+            metrics: Signal::new(Metrics::load(
+                &Config::default().font,
+                Config::default().appearance.font_size,
+            )),
             window: Rc::new(RefCell::new(None)),
             maximized: Signal::new(false),
             clipboard: Rc::new(RefCell::new(None)),
@@ -77,13 +80,52 @@ impl State {
     pub fn add(&self) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
-        let command = if self.command.is_empty() {
-            self.config.peek().shell_command()
+        let config = self.config.peek();
+        let active_cwd = self.current().map(|tab| tab.session.borrow().cwd.clone());
+        let (command, cwd, options) = if self.command.is_empty() {
+            match config.active_profile() {
+                Ok(profile) => {
+                    let cwd = active_cwd.unwrap_or_else(|| {
+                        profile
+                            .initial_directory
+                            .as_ref()
+                            .map(|path| {
+                                if path.is_absolute() {
+                                    path.clone()
+                                } else {
+                                    self.cwd.join(path)
+                                }
+                            })
+                            .unwrap_or_else(|| self.cwd.clone())
+                    });
+                    (
+                        config.profile_command(),
+                        cwd,
+                        SessionOptions {
+                            environment: profile.environment.clone(),
+                            scrollback: config.scrollback,
+                            theme: profile.theme,
+                        },
+                    )
+                }
+                Err(error) => (Err(error), self.cwd.clone(), SessionOptions::default()),
+            }
         } else {
-            Ok(self.command.clone())
+            (
+                Ok(self.command.clone()),
+                self.cwd.clone(),
+                SessionOptions {
+                    scrollback: config.scrollback,
+                    theme: config
+                        .active_profile()
+                        .map(|profile| profile.theme)
+                        .unwrap_or_default(),
+                    ..Default::default()
+                },
+            )
         };
         let result = command.and_then(|command| {
-            Session::spawn(id, &self.cwd, &command, self.sender.clone())
+            Session::spawn_with(id, &cwd, &command, &options, self.sender.clone())
                 .map_err(|e| format!("{e:#}"))
         });
         match result {
@@ -297,7 +339,7 @@ impl State {
     pub fn configure(&self, config: Config) {
         match config.bindings() {
             Ok(bindings) => {
-                let metrics = Metrics::load(&config.font);
+                let metrics = Metrics::load(&config.font, config.appearance.font_size);
                 creamui_reactive::batch(|| {
                     if !config.island.enabled {
                         for tab in self.tabs.peek() {
@@ -543,9 +585,13 @@ impl State {
         ))
     }
     fn new_window(&self) {
+        let cwd = self
+            .current()
+            .map(|tab| tab.session.borrow().cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
         let result = std::env::current_exe().and_then(|exe| {
             let mut command = std::process::Command::new(exe);
-            command.arg("--working-directory").arg(&self.cwd);
+            command.arg("--working-directory").arg(cwd);
             if !self.command.is_empty() {
                 command.arg("-e").args(&self.command);
             }
@@ -723,6 +769,8 @@ impl State {
             title.clone()
         } else if session.exited.is_some() {
             "Exited".into()
+        } else if let Some(name) = session.cwd.file_name() {
+            name.to_string_lossy().into_owned()
         } else {
             "Terminal".into()
         }

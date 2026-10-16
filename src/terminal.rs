@@ -2,13 +2,30 @@
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{self, SyncSender},
     thread,
 };
 
 pub const SCROLLBACK: usize = 10_000;
+
+#[derive(Clone, Debug)]
+pub struct SessionOptions {
+    pub environment: BTreeMap<String, String>,
+    pub scrollback: usize,
+    pub theme: crate::config::TerminalTheme,
+}
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            environment: BTreeMap::new(),
+            scrollback: SCROLLBACK,
+            theme: crate::config::TerminalTheme::Default,
+        }
+    }
+}
 
 /// Working directory for tests that only need a live PTY, on either platform.
 #[cfg(test)]
@@ -30,6 +47,7 @@ pub enum Event {
 #[derive(Default)]
 pub struct Callbacks {
     pub title: String,
+    pub cwd: Option<PathBuf>,
     pub replies: Vec<u8>,
 }
 impl vt100::Callbacks for Callbacks {
@@ -70,10 +88,42 @@ impl vt100::Callbacks for Callbacks {
         };
         self.replies.extend_from_slice(reply.as_bytes());
     }
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if let [b"7", value] = params {
+            self.cwd = parse_osc7(value);
+        }
+    }
+}
+
+fn parse_osc7(value: &[u8]) -> Option<PathBuf> {
+    let value = std::str::from_utf8(value).ok()?;
+    let location = value.strip_prefix("file://")?;
+    let (host, path) = location.split_once('/')?;
+    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(path.len() + 1);
+    decoded.push(b'/');
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let path = PathBuf::from(std::str::from_utf8(&decoded).ok()?);
+    path.is_absolute().then_some(path)
 }
 
 pub struct Session {
     pub id: u64,
+    pub cwd: PathBuf,
+    pub theme: crate::config::TerminalTheme,
     pub parser: vt100::Parser<Callbacks>,
     pub exited: Option<String>,
     pub search: crate::search::Search,
@@ -83,10 +133,20 @@ pub struct Session {
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
 impl Session {
+    #[cfg(test)]
     pub fn spawn(
         id: u64,
         cwd: &Path,
         command: &[String],
+        events: SyncSender<Event>,
+    ) -> Result<Self> {
+        Self::spawn_with(id, cwd, command, &SessionOptions::default(), events)
+    }
+    pub fn spawn_with(
+        id: u64,
+        cwd: &Path,
+        command: &[String],
+        options: &SessionOptions,
         events: SyncSender<Event>,
     ) -> Result<Self> {
         let pair = native_pty_system().openpty(PtySize {
@@ -112,6 +172,9 @@ impl Session {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", env!("CARGO_PKG_NAME"));
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        for (key, value) in &options.environment {
+            cmd.env(key, value);
+        }
         // An inherited size would override the PTY's negotiated dimensions in some shells.
         cmd.env_remove("LINES");
         cmd.env_remove("COLUMNS");
@@ -221,7 +284,14 @@ impl Session {
         }
         Ok(Self {
             id,
-            parser: vt100::Parser::new_with_callbacks(24, 80, SCROLLBACK, Callbacks::default()),
+            cwd: cwd.to_path_buf(),
+            theme: options.theme,
+            parser: vt100::Parser::new_with_callbacks(
+                24,
+                80,
+                options.scrollback,
+                Callbacks::default(),
+            ),
             exited: None,
             search: crate::search::Search::default(),
             control_mode: None,
@@ -232,6 +302,9 @@ impl Session {
     }
     pub fn process(&mut self, bytes: &[u8]) -> Result<()> {
         self.parser.process(bytes);
+        if let Some(cwd) = self.parser.callbacks_mut().cwd.take() {
+            self.cwd = cwd;
+        }
         self.refresh_mode();
         let replies = std::mem::take(&mut self.parser.callbacks_mut().replies);
         if !replies.is_empty() {
@@ -309,6 +382,15 @@ mod tests {
         parser.process(b"\x1b[?1049hother\x1b[?1049l");
         assert_eq!(parser.screen().contents(), "hi");
     }
+    #[test]
+    fn osc7_updates_the_working_directory_and_rejects_remote_hosts() {
+        assert_eq!(
+            parse_osc7(b"file://localhost/tmp/a%20b"),
+            Some(PathBuf::from("/tmp/a b"))
+        );
+        assert_eq!(parse_osc7(b"file://remote/tmp"), None);
+        assert_eq!(parse_osc7(b"invalid"), None);
+    }
     #[cfg(unix)]
     #[test]
     fn real_pty_has_correct_size_environment_and_reaps_child() {
@@ -340,6 +422,40 @@ mod tests {
         let text = session.parser.screen().contents();
         assert!(text.contains("32 100"), "{text}");
         assert!(text.contains("xterm-256color:/tmp:hello"), "{text}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn profile_options_apply_environment_scrollback_and_theme() {
+        let (tx, rx) = mpsc::sync_channel(128);
+        let mut session = Session::spawn_with(
+            8,
+            Path::new("/tmp"),
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf %s \"$DTERM_PROFILE_TEST\"".into(),
+            ],
+            &SessionOptions {
+                environment: BTreeMap::from([("DTERM_PROFILE_TEST".into(), "applied".into())]),
+                scrollback: 7,
+                theme: crate::config::TerminalTheme::Dracula,
+            },
+            tx,
+        )
+        .unwrap();
+        assert_eq!(session.cwd, Path::new("/tmp"));
+        assert_eq!(session.theme, crate::config::TerminalTheme::Dracula);
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                Event::Output(_, bytes) => session.process(&bytes).unwrap(),
+                Event::Exited(_, status) => {
+                    session.finish(status);
+                    break;
+                }
+                Event::Configuration(_) => unreachable!(),
+            }
+        }
+        assert!(session.parser.screen().contents().contains("applied"));
     }
     #[cfg(windows)]
     #[test]
