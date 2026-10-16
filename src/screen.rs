@@ -55,6 +55,56 @@ impl Metrics {
     }
 }
 pub type Position = (u16, u16);
+
+pub fn target_at(screen: &vt100::Screen, row: u16, col: u16) -> Option<String> {
+    let (_, columns) = screen.size();
+    if row >= screen.size().0 || col >= columns {
+        return None;
+    }
+    let mut cells = Vec::new();
+    for column in 0..columns {
+        let cell = screen.cell(row, column)?;
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let value = if cell.has_contents() {
+            cell.contents()
+        } else {
+            " "
+        };
+        cells.push((column, column + if cell.is_wide() { 2 } else { 1 }, value));
+    }
+    let index = cells
+        .iter()
+        .position(|(start, end, _)| (*start..*end).contains(&col))?;
+    let is_separator = |value: &str| value.chars().all(char::is_whitespace);
+    if is_separator(cells[index].2) {
+        return None;
+    }
+    let first = (0..=index)
+        .rev()
+        .find(|&index| index == 0 || is_separator(cells[index - 1].2))?;
+    let last = (index..cells.len())
+        .find(|&index| is_separator(cells[index].2))
+        .unwrap_or(cells.len());
+    let token = cells[first..last]
+        .iter()
+        .map(|(_, _, value)| *value)
+        .collect::<String>();
+    let token = token
+        .trim_start_matches(['(', '[', '{', '"', '\''])
+        .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '"', '\'']);
+    if token.starts_with("https://")
+        || token.starts_with("http://")
+        || token.starts_with("file://")
+        || token.starts_with('/')
+        || token.starts_with("~/")
+    {
+        Some(token.into())
+    } else {
+        None
+    }
+}
 #[derive(Clone, Copy)]
 pub struct Selection {
     pub anchor: Position,
@@ -105,6 +155,8 @@ pub struct TerminalScreen {
     pub selection: Signal<Option<Selection>>,
     pub revision: Signal<u64>,
     pub metrics: Metrics,
+    pub ctrl_held: Signal<bool>,
+    pub open_target: Option<Rc<dyn Fn(String)>>,
 }
 impl TerminalScreen {
     fn position(metrics: Metrics, p: Point, screen: &vt100::Screen) -> Position {
@@ -246,8 +298,21 @@ impl Widget for TerminalScreen {
         let session = self.session.clone();
         let selection = self.selection.clone();
         let metrics = self.metrics;
+        let ctrl_held = self.ctrl_held.clone();
+        let open_target = self.open_target.clone();
         Some(Rc::new(move |p, _| {
-            let pos = Self::position(metrics, p, session.borrow().parser.screen());
+            let screen = session.borrow();
+            let pos = Self::position(metrics, p, screen.parser.screen());
+            if ctrl_held.peek() {
+                if let Some(target) = target_at(screen.parser.screen(), pos.0, pos.1) {
+                    if let Some(open) = &open_target {
+                        open(target);
+                        selection.set(None);
+                        return;
+                    }
+                }
+            }
+            drop(screen);
             selection.set(Some(Selection {
                 anchor: pos,
                 end: pos,
@@ -451,6 +516,64 @@ fn color_with_palette(value: vt100::Color, default: Color, ansi: [Color; 16]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_at_extracts_urls_and_file_paths() {
+        let mut parser = vt100::Parser::new(2, 80, 0);
+        let line = "Open (https://example.test/docs?q=1), then /tmp/output.txt";
+        parser.process(line.as_bytes());
+        assert_eq!(
+            target_at(parser.screen(), 0, line.find("example").unwrap() as u16),
+            Some("https://example.test/docs?q=1".into())
+        );
+        assert_eq!(
+            target_at(parser.screen(), 0, line.find("/tmp").unwrap() as u16),
+            Some("/tmp/output.txt".into())
+        );
+        assert_eq!(target_at(parser.screen(), 0, 0), None);
+    }
+
+    #[test]
+    fn ctrl_drag_opens_a_target_without_starting_selection() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let mut session = Session::spawn(
+            1,
+            &crate::terminal::idle_cwd(),
+            &crate::terminal::idle_command(),
+            tx,
+        )
+        .unwrap();
+        session.resize(2, 80).unwrap();
+        session.process(b"https://example.test/docs").unwrap();
+        let opened = Rc::new(RefCell::new(None));
+        let callback_target = opened.clone();
+        let metrics = Metrics {
+            width: 8.0,
+            height: 16.0,
+            font_size: 14.0,
+        };
+        let selection = Signal::new(None);
+        let screen = TerminalScreen {
+            session: Rc::new(RefCell::new(session)),
+            selection: selection.clone(),
+            revision: Signal::new(0),
+            metrics,
+            ctrl_held: Signal::new(true),
+            open_target: Some(Rc::new(move |target| {
+                *callback_target.borrow_mut() = Some(target)
+            })),
+        };
+        Widget::on_drag_start(&screen).unwrap()(
+            Point {
+                x: PADDING + 8.0 * metrics.width + 1.0,
+                y: TOP_PADDING + 1.0,
+            },
+            Rect::default(),
+        );
+        assert_eq!(*opened.borrow(), Some("https://example.test/docs".into()));
+        assert!(selection.peek().is_none());
+    }
+
     #[test]
     fn terminal_themes_override_ansi_and_default_colors() {
         let base = ColorScheme::dark();
@@ -516,6 +639,8 @@ mod tests {
                 selection: Signal::new(None),
                 revision: Signal::new(0),
                 metrics,
+                ctrl_held: Signal::new(false),
+                open_target: None,
             };
             let mut gpu = HeadlessGpu::new().ok();
             if let Some(gpu) = &gpu {
@@ -648,6 +773,8 @@ mod tests {
                     height: 23.0,
                     font_size: 14.0,
                 },
+                ctrl_held: Signal::new(false),
+                open_target: None,
             };
             for scale in [1.0, 1.25, 1.5, 2.0] {
                 let width = (160.0 * scale) as u32;

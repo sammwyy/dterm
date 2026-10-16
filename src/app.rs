@@ -52,6 +52,7 @@ pub struct State {
     pub window: Rc<RefCell<Option<WindowHandle>>>,
     maximized: Signal<bool>,
     clipboard: Rc<RefCell<Option<arboard::Clipboard>>>,
+    ctrl_held: Signal<bool>,
     session_file: Rc<RefCell<Option<PathBuf>>>,
 }
 impl State {
@@ -76,6 +77,7 @@ impl State {
             window: Rc::new(RefCell::new(None)),
             maximized: Signal::new(false),
             clipboard: Rc::new(RefCell::new(None)),
+            ctrl_held: Signal::new(false),
             session_file: Rc::new(RefCell::new(None)),
         }
     }
@@ -342,6 +344,7 @@ impl State {
         }
     }
     pub fn key(&self, event: KeyEvent, m: Modifiers) -> bool {
+        self.ctrl_held.set(m.ctrl);
         if !event.pressed {
             return true;
         }
@@ -535,6 +538,33 @@ impl State {
     }
     pub fn show_error(&self, message: String) {
         self.error.set(Some(message));
+    }
+    fn open_target(&self, target: String) {
+        let target = if target.starts_with('/') || target.starts_with("~/") {
+            let path = if let Some(rest) = target.strip_prefix("~/") {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("~"))
+                    .join(rest)
+            } else {
+                PathBuf::from(target)
+            };
+            if !path.exists() {
+                self.show_error(format!("File does not exist: {}", path.display()));
+                return;
+            }
+            path.to_string_lossy().into_owned()
+        } else {
+            target
+        };
+        match crate::backends::open_url(&target).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(error) => self.show_error(format!("Couldn't open target: {error}")),
+        }
     }
     fn dispatch(&self, action: Action) {
         match action {
@@ -1162,6 +1192,11 @@ impl State {
                 selection: tab.selection.clone(),
                 revision: self.revision.clone(),
                 metrics,
+                ctrl_held: self.ctrl_held.clone(),
+                open_target: {
+                    let state = self.clone();
+                    Some(Rc::new(move |target| state.open_target(target)))
+                },
             }));
         } else {
             let retry = self.clone();
@@ -1863,6 +1898,8 @@ mod tests {
                 selection: tab.selection.clone(),
                 revision: state.revision.clone(),
                 metrics: state.metrics.peek(),
+                ctrl_held: state.ctrl_held.clone(),
+                open_target: None,
             };
             creamui_core::Widget::on_scroll(&screen).unwrap()(-40.0);
             let id = tab.session.borrow().id;
