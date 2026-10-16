@@ -159,6 +159,8 @@ pub struct TerminalScreen {
     pub open_target: Option<Rc<dyn Fn(String)>>,
     pub focused: bool,
     pub on_focus: Option<Rc<dyn Fn()>>,
+    pub ligatures: bool,
+    pub background_opacity: u8,
 }
 impl TerminalScreen {
     fn position(metrics: Metrics, p: Point, screen: &vt100::Screen) -> Position {
@@ -198,7 +200,11 @@ impl Widget for TerminalScreen {
         let terminal = terminal_colors(session.theme, theme.colors);
         painter.push_clip(rect);
         if session.theme != TerminalTheme::Default {
-            painter.fill_rect(rect, terminal.background, 0.0);
+            painter.fill_rect(
+                rect,
+                with_opacity(terminal.background, self.background_opacity),
+                0.0,
+            );
         }
         let (rows, cols) = screen.size();
         let scale = painter.scale_factor();
@@ -219,9 +225,9 @@ impl Widget for TerminalScreen {
                     Some(false) => terminal.background.mix(theme.colors.accent, 0.35),
                     None => background(col),
                 };
-                let bg = background(start);
+                let bg = with_opacity(background(start), self.background_opacity);
                 let mut end = start + 1;
-                while end < cols && background(end) == bg {
+                while end < cols && with_opacity(background(end), self.background_opacity) == bg {
                     end += 1;
                 }
                 if bg != CLEAR {
@@ -231,11 +237,14 @@ impl Widget for TerminalScreen {
             }
         }
         for row in 0..rows {
-            for col in 0..cols {
+            let mut col = 0;
+            while col < cols {
                 let Some(cell) = screen.cell(row, col) else {
+                    col += 1;
                     continue;
                 };
                 if cell.is_wide_continuation() {
+                    col += 1;
                     continue;
                 }
                 let (mut fg, _) = cell_colors(cell, selected(row, col), theme.colors, terminal);
@@ -243,12 +252,63 @@ impl Widget for TerminalScreen {
                     fg = terminal.background;
                 }
                 let span = if cell.is_wide() { 2 } else { 1 };
+                if self.ligatures
+                    && !cell.is_wide()
+                    && cell.has_contents()
+                    && cell.contents().is_ascii()
+                {
+                    let bold = cell.bold();
+                    let italic = cell.italic();
+                    let mut end = col;
+                    let mut text = String::new();
+                    while end < cols {
+                        let Some(next) = screen.cell(row, end) else {
+                            break;
+                        };
+                        if next.is_wide()
+                            || next.is_wide_continuation()
+                            || !next.has_contents()
+                            || !next.contents().is_ascii()
+                            || next.bold() != bold
+                            || next.italic() != italic
+                        {
+                            break;
+                        }
+                        let (mut next_fg, _) =
+                            cell_colors(next, selected(row, end), theme.colors, terminal);
+                        if session.search.highlight(screen, row, end) == Some(true) {
+                            next_fg = terminal.background;
+                        }
+                        if next_fg != fg {
+                            break;
+                        }
+                        text.push_str(next.contents());
+                        end += 1;
+                    }
+                    if end > col + 1 {
+                        let text_rect = m.cell_rect(rect, row, col, end, scale);
+                        painter.fill_text_font(
+                            Rect {
+                                width: text_rect.width.max(m.width * (end - col) as f32),
+                                height: m.height,
+                                ..text_rect
+                            },
+                            &text,
+                            fg,
+                            m.font_size,
+                            TextAlign::Start,
+                            Some(FONT),
+                            bold,
+                            italic,
+                        );
+                        col = end;
+                        continue;
+                    }
+                }
                 let cell_rect = m.cell_rect(rect, row, col, (col + span).min(cols), scale);
                 if cell.has_contents()
                     && !crate::terminal_graphics::paint(painter, cell.contents(), cell_rect, fg)
                 {
-                    // A rounded cell can be narrower than the font's advance. Give
-                    // shaping its nominal width so a single glyph cannot wrap.
                     let text_rect = Rect {
                         width: cell_rect.width.max(m.width * span as f32),
                         height: m.height,
@@ -265,17 +325,32 @@ impl Widget for TerminalScreen {
                         cell.italic(),
                     );
                 }
-                if cell.underline() {
-                    painter.fill_rect(
-                        Rect {
-                            y: ((cell_rect.y + cell_rect.height - 3.0) * scale).round() / scale,
-                            height: scale.round().max(1.0) / scale,
-                            ..cell_rect
-                        },
-                        fg,
-                        0.0,
-                    );
+                col += span;
+            }
+        }
+        for row in 0..rows {
+            for col in 0..cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() || !cell.underline() {
+                    continue;
                 }
+                let (mut fg, _) = cell_colors(cell, selected(row, col), theme.colors, terminal);
+                if session.search.highlight(screen, row, col) == Some(true) {
+                    fg = terminal.background;
+                }
+                let span = if cell.is_wide() { 2 } else { 1 };
+                let cell_rect = m.cell_rect(rect, row, col, (col + span).min(cols), scale);
+                painter.fill_rect(
+                    Rect {
+                        y: ((cell_rect.y + cell_rect.height - 3.0) * scale).round() / scale,
+                        height: scale.round().max(1.0) / scale,
+                        ..cell_rect
+                    },
+                    fg,
+                    0.0,
+                );
             }
         }
         if screen.scrollback() == 0 && !screen.hide_cursor() && session.exited.is_none() {
@@ -369,6 +444,15 @@ struct TerminalColors {
     background: Color,
     default_background: Color,
     ansi: [Color; 16],
+}
+
+fn with_opacity(color: Color, opacity: u8) -> Color {
+    Color::rgba(
+        color.r,
+        color.g,
+        color.b,
+        (color.a as u16 * opacity as u16 / 100) as u8,
+    )
 }
 
 fn terminal_colors(theme: TerminalTheme, colors: ColorScheme) -> TerminalColors {
@@ -527,6 +611,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ligatures_shape_compatible_terminal_runs_and_opacity_only_fades_backgrounds() {
+        use creamui_core::runtime::{PaintOp, PaintPrimitive, RecordingPainter};
+        use creamui_theme::{Theme, ThemeProvider};
+        creamui_reactive::with_context_scope(|| {
+            let theme = Theme::dark();
+            creamui_reactive::provide_context(ThemeProvider::new(theme));
+            let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+            let text_runs = |ligatures| {
+                let mut session = Session::spawn(
+                    1,
+                    &crate::terminal::idle_cwd(),
+                    &crate::terminal::idle_command(),
+                    tx.clone(),
+                )
+                .unwrap();
+                session.resize(2, 20).unwrap();
+                session.process(b"==> flag").unwrap();
+                let screen = TerminalScreen {
+                    session: Rc::new(RefCell::new(session)),
+                    selection: Signal::new(None),
+                    revision: Signal::new(0),
+                    metrics: Metrics {
+                        width: 8.0,
+                        height: 16.0,
+                        font_size: 14.0,
+                    },
+                    ctrl_held: Signal::new(false),
+                    open_target: None,
+                    focused: false,
+                    on_focus: None,
+                    ligatures,
+                    background_opacity: 100,
+                };
+                let mut painter = RecordingPainter::new(theme.colors);
+                screen.paint(
+                    &mut painter,
+                    Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 180.0,
+                        height: 48.0,
+                    },
+                );
+                painter
+                    .into_ops()
+                    .into_iter()
+                    .filter_map(|op| match op {
+                        PaintOp::Primitive(PaintPrimitive::Text(text)) => {
+                            Some(text.text.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let ligature_runs = text_runs(true);
+            let plain_runs = text_runs(false);
+            assert!(ligature_runs.iter().any(|text| text == "==> flag"));
+            assert!(ligature_runs.len() < plain_runs.len());
+            assert_eq!(
+                with_opacity(Color::rgba(1, 2, 3, 200), 75),
+                Color::rgba(1, 2, 3, 150)
+            );
+        });
+    }
+
+    #[test]
     fn target_at_extracts_urls_and_file_paths() {
         let mut parser = vt100::Parser::new(2, 80, 0);
         let line = "Open (https://example.test/docs?q=1), then /tmp/output.txt";
@@ -573,6 +723,8 @@ mod tests {
             })),
             focused: false,
             on_focus: None,
+            ligatures: true,
+            background_opacity: 100,
         };
         Widget::on_drag_start(&screen).unwrap()(
             Point {
@@ -654,6 +806,8 @@ mod tests {
                 open_target: None,
                 focused: false,
                 on_focus: None,
+                ligatures: true,
+                background_opacity: 100,
             };
             let mut gpu = HeadlessGpu::new().ok();
             if let Some(gpu) = &gpu {
@@ -790,6 +944,8 @@ mod tests {
                 open_target: None,
                 focused: false,
                 on_focus: None,
+                ligatures: true,
+                background_opacity: 100,
             };
             for scale in [1.0, 1.25, 1.5, 2.0] {
                 let width = (160.0 * scale) as u32;

@@ -16,7 +16,7 @@ use creamui_render::{
     platform::{Key, KeyEvent, Modifiers},
     AppHandle, WindowHandle,
 };
-use creamui_theme::use_theme;
+use creamui_theme::{use_theme, Color};
 use creamui_widgets::{
     CUIWindowDragArea, Icon, RawButton, RawTextInput, RawView, ScrollController, Symbol, Text,
 };
@@ -1473,6 +1473,7 @@ impl State {
         show_focus: bool,
         metrics: Metrics,
     ) -> BoxedWidget {
+        let appearance = self.config.peek().appearance.clone();
         match tree {
             PaneTree::Pane(pane) => {
                 let focus = self.clone();
@@ -1489,6 +1490,8 @@ impl State {
                     },
                     focused: show_focus && pane_id == focused,
                     on_focus: Some(Rc::new(move || focus.focus_pane(pane_id))),
+                    ligatures: appearance.ligatures,
+                    background_opacity: appearance.opacity,
                 })
             }
             PaneTree::Split {
@@ -1541,6 +1544,7 @@ impl State {
         let theme = use_theme();
         let tabs = self.tabs.get();
         let active = self.active.get();
+        let opacity = self.config.get().appearance.opacity;
         let error = self.error.get();
         let exited = tabs
             .get(active)
@@ -1557,7 +1561,7 @@ impl State {
                 self.report(result);
             }
         }
-        let mut children = vec![self.header(size.width)];
+        let mut children = vec![self.header(size.width, opacity)];
         if let Some(tab) = tabs.get(active) {
             children.push(self.pane_view(
                 &tab.panes,
@@ -1592,7 +1596,7 @@ impl State {
                     14.0,
                     0.0,
                 ))
-                .background(theme.colors.surface_elevated)
+                .background(with_opacity(theme.colors.surface_elevated, opacity))
                 .with_children(vec![
                     Box::new(Text::secondary(status).font_size(12.0).layout(Style {
                         flex_grow: 1.0,
@@ -1625,7 +1629,7 @@ impl State {
                 },
                 ..column(0.0)
             })
-            .background(theme.colors.surface)
+            .background(with_opacity(theme.colors.surface, opacity))
             .with_children(children),
         )
     }
@@ -1670,7 +1674,7 @@ impl State {
             "Terminal".into()
         }
     }
-    fn header(&self, width: f32) -> BoxedWidget {
+    fn header(&self, width: f32, opacity: u8) -> BoxedWidget {
         let theme = use_theme();
         let (start, end) = chrome::insets(width, chrome::HEADER);
         let actions_right = start > 0.0;
@@ -1750,7 +1754,7 @@ impl State {
                 strip.push(Box::new(
                     RawView::new(fixed(tab_width, 34.0))
                         .background(if index == active {
-                            theme.colors.surface_elevated
+                            with_opacity(theme.colors.surface_elevated, opacity)
                         } else {
                             CLEAR
                         })
@@ -1805,10 +1809,22 @@ impl State {
         Box::new(
             CUIWindowDragArea::new()
                 .layout(fixed(width, chrome::HEADER))
-                .background(theme.colors.surface.mix(theme.colors.accent, 0.025))
+                .background(with_opacity(
+                    theme.colors.surface.mix(theme.colors.accent, 0.025),
+                    opacity,
+                ))
                 .with_children(children),
         )
     }
+}
+
+fn with_opacity(color: Color, opacity: u8) -> Color {
+    Color::rgba(
+        color.r,
+        color.g,
+        color.b,
+        (color.a as u16 * opacity as u16 / 100) as u8,
+    )
 }
 
 fn search_key(key: &Key) -> Option<creamui_core::Key> {
@@ -2314,6 +2330,8 @@ mod tests {
                 open_target: None,
                 focused: false,
                 on_focus: None,
+                ligatures: true,
+                background_opacity: 100,
             };
             creamui_core::Widget::on_scroll(&screen).unwrap()(-40.0);
             let id = tab.session.borrow().id;
