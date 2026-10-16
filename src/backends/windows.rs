@@ -44,7 +44,12 @@ impl Backend for Windows {
     }
     fn monospace_candidates(bold: bool) -> Vec<PathBuf> {
         let names: &[&str] = if bold {
-            &["consolab.ttf", "CascadiaMono.ttf", "CascadiaCode.ttf", "lucon.ttf"]
+            &[
+                "consolab.ttf",
+                "CascadiaMono.ttf",
+                "CascadiaCode.ttf",
+                "lucon.ttf",
+            ]
         } else {
             &[
                 "CascadiaMono.ttf",
@@ -124,7 +129,12 @@ fn font_dirs() -> Vec<PathBuf> {
         directories.push(PathBuf::from(windir).join("Fonts"));
     }
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        directories.push(PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"));
+        directories.push(
+            PathBuf::from(local)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Fonts"),
+        );
     }
     directories
 }

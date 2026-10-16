@@ -3,10 +3,10 @@
 
 mod fonts;
 
-#[cfg(unix)]
-mod unix;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(unix)]
+mod unix;
 #[cfg(windows)]
 mod windows;
 
@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 /// What to do with the bytes read before the child has produced a normal frame.
 pub enum Startup {
     /// Keep the bytes. The query may be split across reads.
+    #[cfg_attr(
+        not(windows),
+        expect(dead_code, reason = "only ConPTY needs a split startup query")
+    )]
     NeedMore,
     /// `pending` is the output to deliver. `reply` is written to the PTY first.
     Ready { reply: Option<Vec<u8>> },
@@ -76,7 +80,10 @@ pub fn missing_shell(shell: &str, fallbacks: &[&str]) -> String {
         [] => format!("Couldn't find {shell:?} in PATH"),
         [only] => format!("Couldn't find {shell:?} or {only} in PATH"),
         [head @ .., last] => {
-            format!("Couldn't find {shell:?}, {} or {last} in PATH", head.join(", "))
+            format!(
+                "Couldn't find {shell:?}, {} or {last} in PATH",
+                head.join(", ")
+            )
         }
     }
 }

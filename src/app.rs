@@ -957,7 +957,11 @@ mod tests {
             creamui_reactive::provide_context(ThemeProvider::new(theme));
             creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
             let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-            let state = State::new(crate::terminal::idle_cwd(), crate::terminal::idle_command(), tx);
+            let state = State::new(
+                crate::terminal::idle_cwd(),
+                crate::terminal::idle_command(),
+                tx,
+            );
             state.add();
             let tab = state.current().unwrap();
             tab.session
@@ -1064,7 +1068,11 @@ mod tests {
     #[test]
     fn disabling_island_closes_modes_in_all_tabs_and_blocks_activation() {
         let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-        let state = State::new(crate::terminal::idle_cwd(), crate::terminal::idle_command(), tx);
+        let state = State::new(
+            crate::terminal::idle_cwd(),
+            crate::terminal::idle_command(),
+            tx,
+        );
         for _ in 0..2 {
             state.add();
             state.dispatch(Action::Search);
@@ -1094,7 +1102,11 @@ mod tests {
     #[test]
     fn native_search_keys_work_outside_the_window_context() {
         let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-        let state = State::new(crate::terminal::idle_cwd(), crate::terminal::idle_command(), tx);
+        let state = State::new(
+            crate::terminal::idle_cwd(),
+            crate::terminal::idle_command(),
+            tx,
+        );
         state.add();
         let build = state.clone();
         let effect = creamui_reactive::with_context_scope(|| {
@@ -1165,7 +1177,11 @@ mod tests {
             creamui_reactive::provide_context(ThemeProvider::new(theme));
             creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
             let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-            let state = State::new(crate::terminal::idle_cwd(), crate::terminal::idle_command(), tx);
+            let state = State::new(
+                crate::terminal::idle_cwd(),
+                crate::terminal::idle_command(),
+                tx,
+            );
             state.configure(Config::parse("[shortcuts]\nsearch = 'F6'").unwrap());
             state.add();
             let tab = state.current().unwrap();
@@ -1263,7 +1279,11 @@ mod tests {
             creamui_reactive::provide_context(ThemeProvider::new(Theme::light()));
             creamui_reactive::provide_context(Signal::new(WindowDecorations::default()));
             let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-            let state = State::new(crate::terminal::idle_cwd(), crate::terminal::idle_command(), tx);
+            let state = State::new(
+                crate::terminal::idle_cwd(),
+                crate::terminal::idle_command(),
+                tx,
+            );
             state.add();
             let renders = Rc::new(std::cell::Cell::new(0));
             let render_state = state.clone();
@@ -1323,7 +1343,11 @@ mod tests {
                 let decorations = Signal::new(WindowDecorations::default());
                 creamui_reactive::provide_context(decorations.clone());
                 let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-                let state = State::new(crate::terminal::idle_cwd(), crate::terminal::idle_command(), tx);
+                let state = State::new(
+                    crate::terminal::idle_cwd(),
+                    crate::terminal::idle_command(),
+                    tx,
+                );
                 state.add();
                 state
                     .current()
@@ -1374,7 +1398,11 @@ mod tests {
     #[test]
     fn custom_shortcuts_reload_without_replacing_sessions_and_indices_select_tabs() {
         let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-        let state = State::new(crate::terminal::idle_cwd(), crate::terminal::idle_command(), tx);
+        let state = State::new(
+            crate::terminal::idle_cwd(),
+            crate::terminal::idle_command(),
+            tx,
+        );
         state.add();
         state.add();
         let id = state.current().unwrap().session.borrow().id;
@@ -1454,7 +1482,11 @@ mod tests {
                 let decorations = Signal::new(WindowDecorations::default());
                 creamui_reactive::provide_context(decorations.clone());
                 let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-                let state = State::new(crate::terminal::idle_cwd(), crate::terminal::idle_command(), tx);
+                let state = State::new(
+                    crate::terminal::idle_cwd(),
+                    crate::terminal::idle_command(),
+                    tx,
+                );
                 state.add();
                 state.current().unwrap().session.borrow_mut().process(b"\x1b]2;~/Projects\x07\x1b[32msammy\x1b[0m \x1b[34m~/Projects\x1b[0m $ cargo build\r\n   \x1b[32mCompiling\x1b[0m dterm v0.1.0\r\n    \x1b[32mFinished\x1b[0m dev profile in 0.42s\r\n\r\n$ ").unwrap();
                 state.add();
@@ -1518,7 +1550,11 @@ mod tests {
     #[test]
     fn closing_tabs_keeps_the_active_session_and_shortcuts_switch_tabs() {
         let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-        let state = State::new(crate::terminal::idle_cwd(), crate::terminal::idle_command(), tx);
+        let state = State::new(
+            crate::terminal::idle_cwd(),
+            crate::terminal::idle_command(),
+            tx,
+        );
         state.add();
         state.add();
         state.add();

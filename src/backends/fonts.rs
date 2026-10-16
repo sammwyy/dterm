@@ -115,7 +115,7 @@ fn scan_families() -> Vec<Family> {
     for directory in select_backend!(font_directories()) {
         walk_faces(&directory, &mut found, 0);
     }
-    found.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    found.sort_by_key(|family| family.name.to_ascii_lowercase());
     found
 }
 
@@ -286,7 +286,8 @@ mod tests {
         assert!(
             height / SAMPLE_PX <= 1.5,
             "line box is too tall: ascent={} descent={} height={height}",
-            line.ascent, line.descent
+            line.ascent,
+            line.descent
         );
     }
 }

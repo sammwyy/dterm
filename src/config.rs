@@ -210,10 +210,7 @@ mod tests {
         assert!(Config::parse("[shortcuts]\nnew_tab='Ctrl+Shift+N'").is_err());
         assert!(Config::parse("shell=''").is_err());
         assert!(Config::parse("font=''").is_err());
-        assert_eq!(
-            Config::parse("font='Consolas'").unwrap().font,
-            "Consolas"
-        );
+        assert_eq!(Config::parse("font='Consolas'").unwrap().font, "Consolas");
         assert!(Config::parse("[shortcuts]\nunknown='Ctrl+K'").is_err());
     }
     #[test]
@@ -292,7 +289,9 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_ascii_lowercase(),
-            root.join("custom.exe").to_string_lossy().to_ascii_lowercase()
+            root.join("custom.exe")
+                .to_string_lossy()
+                .to_ascii_lowercase()
         );
         assert_eq!(
             resolve_shell("missing", Some(&path))

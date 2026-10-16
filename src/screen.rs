@@ -352,8 +352,13 @@ mod tests {
             let theme = Theme::dark();
             creamui_reactive::provide_context(ThemeProvider::new(theme));
             let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-            let mut session =
-                Session::spawn(1, &crate::terminal::idle_cwd(), &crate::terminal::idle_command(), tx).unwrap();
+            let mut session = Session::spawn(
+                1,
+                &crate::terminal::idle_cwd(),
+                &crate::terminal::idle_command(),
+                tx,
+            )
+            .unwrap();
             session.resize(8, 12).unwrap();
             session.process(b"\x1b[?25l\x1b[44m            ").unwrap();
             session.process(b"\x1b[2;1H").unwrap();
@@ -502,8 +507,13 @@ mod tests {
             let theme = Theme::dark();
             creamui_reactive::provide_context(ThemeProvider::new(theme));
             let (tx, _rx) = std::sync::mpsc::sync_channel(128);
-            let mut session =
-                Session::spawn(1, &crate::terminal::idle_cwd(), &crate::terminal::idle_command(), tx).unwrap();
+            let mut session = Session::spawn(
+                1,
+                &crate::terminal::idle_cwd(),
+                &crate::terminal::idle_command(),
+                tx,
+            )
+            .unwrap();
             session.resize(3, 12).unwrap();
             session.process(b"\x1b[?25l\x1b[44m            ").unwrap();
             let screen = TerminalScreen {
