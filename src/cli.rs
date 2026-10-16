@@ -1,9 +1,11 @@
 use std::{ffi::OsString, path::PathBuf};
-pub const HELP:&str="Terminal\n\nUsage: dterm [--working-directory DIR] [-e COMMAND [ARGS...]]\n       dterm --settings\n\n  --settings                Open settings\n  --working-directory DIR   Start shells in DIR\n  -e, --command COMMAND ... Run a program instead of the default shell\n  -h, --help                Show this help\n  -V, --version             Show the version\n\nDefault shortcuts (configurable in --settings):\n           Ctrl+Shift+T new tab, Ctrl+Shift+N new window,\n           Ctrl+Shift+W close tab, Ctrl+Tab next tab,\n           Ctrl+Shift+C/V copy/paste, Shift+PageUp/PageDown scrollback.";
+pub const HELP:&str="Terminal\n\nUsage: dterm [--working-directory DIR] [-e COMMAND [ARGS...]]\n       dterm --settings\n       dterm --export-config FILE\n       dterm --import-config FILE\n\n  --settings                Open settings\n  --working-directory DIR   Start shells in DIR\n  -e, --command COMMAND ... Run a program instead of the default shell\n  --export-config FILE      Write the current settings as TOML\n  --import-config FILE      Validate and install settings from TOML\n  -h, --help                Show this help\n  -V, --version             Show the version\n\nDefault shortcuts (configurable in --settings):\n           Ctrl+Shift+T new tab, Ctrl+Shift+N new window,\n           Ctrl+Shift+W close tab, Ctrl+Tab next tab,\n           Ctrl+Shift+C/V copy/paste, Shift+PageUp/PageDown scrollback.";
 #[derive(Debug, PartialEq)]
 pub enum Launch {
     Terminal { cwd: PathBuf, command: Vec<String> },
     Settings,
+    ExportConfig(PathBuf),
+    ImportConfig(PathBuf),
     Help,
     Version,
 }
@@ -18,6 +20,22 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Launch, String>
                     return Err("--settings doesn't accept other arguments".into());
                 }
                 return Ok(Launch::Settings);
+            }
+            Some("--export-config") => {
+                let path =
+                    PathBuf::from(args.next().ok_or("--export-config requires a file path")?);
+                if args.next().is_some() {
+                    return Err("--export-config doesn't accept other arguments".into());
+                }
+                return Ok(Launch::ExportConfig(path));
+            }
+            Some("--import-config") => {
+                let path =
+                    PathBuf::from(args.next().ok_or("--import-config requires a file path")?);
+                if args.next().is_some() {
+                    return Err("--import-config doesn't accept other arguments".into());
+                }
+                return Ok(Launch::ImportConfig(path));
             }
             Some("--help" | "-h") => return Ok(Launch::Help),
             Some("--version" | "-V") => return Ok(Launch::Version),
@@ -62,6 +80,16 @@ mod tests {
     fn settings_and_command_arguments() {
         assert_eq!(p(&["--settings"]).unwrap(), Launch::Settings);
         assert!(p(&["--settings", "x"]).is_err());
+        assert_eq!(
+            p(&["--export-config", "/tmp/settings.toml"]).unwrap(),
+            Launch::ExportConfig(PathBuf::from("/tmp/settings.toml"))
+        );
+        assert_eq!(
+            p(&["--import-config", "/tmp/settings.toml"]).unwrap(),
+            Launch::ImportConfig(PathBuf::from("/tmp/settings.toml"))
+        );
+        assert!(p(&["--export-config"]).is_err());
+        assert!(p(&["--import-config", "a", "b"]).is_err());
         assert!(p(&["-e"]).is_err());
         assert!(p(&["--working-directory"]).is_err());
         assert!(p(&["--invalid"]).is_err());

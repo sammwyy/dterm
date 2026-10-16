@@ -26,8 +26,21 @@ fn main() -> Result<(), String> {
         cli::Launch::Help => println!("{}", cli::HELP),
         cli::Launch::Version => println!("Terminal {}", env!("CARGO_PKG_VERSION")),
         cli::Launch::Settings => run_settings(),
+        cli::Launch::ExportConfig(path) => export_config(path)?,
+        cli::Launch::ImportConfig(path) => import_config(path)?,
         cli::Launch::Terminal { cwd, command } => run_terminal(cwd, command),
     }
+    Ok(())
+}
+fn export_config(path: std::path::PathBuf) -> Result<(), String> {
+    config::Config::load()?.save_to(&path)?;
+    println!("Exported settings to {}", path.display());
+    Ok(())
+}
+fn import_config(path: std::path::PathBuf) -> Result<(), String> {
+    let config = config::Config::import_from(&path)?;
+    config.save_to(&config::path())?;
+    println!("Imported settings from {}", path.display());
     Ok(())
 }
 fn options(title: &str, width: u32, height: u32) -> WindowOptions {

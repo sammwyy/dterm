@@ -291,6 +291,11 @@ impl Config {
         }
         result.map_err(|e| e.to_string())
     }
+    pub fn import_from(path: &Path) -> Result<Self, String> {
+        let text =
+            fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        Self::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
+    }
     pub fn shell_command(&self) -> Result<Vec<String>, String> {
         resolve_shell(&self.shell, std::env::var_os("PATH").as_deref())
             .map(|path| vec![path.to_string_lossy().into_owned()])
@@ -445,6 +450,18 @@ mod tests {
         assert_eq!(Config::load_paths(&[user.clone(), system]).unwrap(), c);
         Config::default().save_to(&user).unwrap();
         assert_eq!(Config::load_paths(&[user]).unwrap(), Config::default());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn imported_configuration_is_validated_before_it_is_saved() {
+        let root = fixture();
+        let file = root.join("import.toml");
+        fs::write(&file, "[appearance]\nfont_size=18\nopacity=90\n").unwrap();
+        let imported = Config::import_from(&file).unwrap();
+        assert_eq!(imported.appearance.font_size, 18);
+        assert_eq!(imported.appearance.opacity, 90);
+        fs::write(&file, "[appearance]\nfont_size=3\n").unwrap();
+        assert!(Config::import_from(&file).is_err());
         fs::remove_dir_all(root).unwrap();
     }
     #[cfg(unix)]
