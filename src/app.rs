@@ -367,6 +367,26 @@ impl State {
                         }
                     }
                 },
+                Mode::RenameTab => match event.key {
+                    Key::Enter => self.rename_tab(),
+                    _ => {
+                        if let Some(key) = search_key(&event.key) {
+                            if let Some(editor) = self.palette_editor() {
+                                if let Some(handler) = editor.on_key() {
+                                    handler(creamui_core::KeyInput {
+                                        key,
+                                        modifiers: creamui_core::Modifiers {
+                                            ctrl: m.ctrl,
+                                            shift: m.shift,
+                                            alt: m.alt,
+                                            logo: m.logo,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                },
             }
             return true;
         }
@@ -438,6 +458,7 @@ impl State {
             Action::Paste => self.paste(),
             Action::Search => self.activate_mode(Mode::Search),
             Action::Palette => self.activate_mode(Mode::Palette),
+            Action::RenameTab => self.activate_mode(Mode::RenameTab),
             Action::Settings => open_settings(),
             Action::ScrollUp | Action::ScrollDown => {
                 if let Some(tab) = self.current() {
@@ -489,6 +510,16 @@ impl State {
         if let Some(tab) = self.current() {
             tab.session.borrow_mut().set_mode(None);
             self.revision.update(|v| *v = v.wrapping_add(1));
+        }
+    }
+    fn rename_tab(&self) {
+        if let Some(tab) = self.current() {
+            let mut session = tab.session.borrow_mut();
+            let title = session.palette.query.trim();
+            session.manual_title = (!title.is_empty()).then(|| title.to_string());
+            session.control_mode = None;
+            drop(session);
+            self.revision.update(|value| *value = value.wrapping_add(1));
         }
     }
     fn navigate_search(&self, previous: bool) {
@@ -782,6 +813,55 @@ impl State {
         }
         Some((view(column(6.0), children), preferred))
     }
+    fn rename_tab_content(&self, orientation: Orientation) -> Option<(BoxedWidget, Size)> {
+        let input = self.palette_input()?;
+        let rename = self.clone();
+        let clear = self.clone();
+        let vertical = orientation == Orientation::Vertical;
+        let preferred = if vertical {
+            Size {
+                width: 260.0,
+                height: 150.0,
+            }
+        } else {
+            Size {
+                width: 460.0,
+                height: 82.0,
+            }
+        };
+        Some((
+            view(
+                if vertical { column(8.0) } else { row(8.0) },
+                vec![
+                    view(
+                        Style {
+                            flex_grow: 1.0,
+                            flex_basis: Dimension::Length(0.0),
+                            ..column(4.0)
+                        },
+                        vec![
+                            Box::new(Text::secondary("Tab name").font_size(12.0)),
+                            Box::new(input),
+                        ],
+                    ),
+                    button("Clear", if vertical { 244.0 } else { 60.0 }, move || {
+                        if let Some(tab) = clear.current() {
+                            let mut session = tab.session.borrow_mut();
+                            session.manual_title = None;
+                            session.control_mode = None;
+                        }
+                        clear
+                            .revision
+                            .update(|value| *value = value.wrapping_add(1));
+                    }),
+                    button("Save", if vertical { 244.0 } else { 56.0 }, move || {
+                        rename.rename_tab()
+                    }),
+                ],
+            ),
+            preferred,
+        ))
+    }
     fn control_island(&self, area: Rect) -> Option<BoxedWidget> {
         let config = self.config.get().island;
         let tab = self.current()?;
@@ -793,6 +873,7 @@ impl State {
             Mode::Search => self.search_content(config.orientation, area.width)?,
             Mode::PasteConfirm => self.paste_confirmation_content(config.orientation)?,
             Mode::Palette => self.palette_content(config.orientation)?,
+            Mode::RenameTab => self.rename_tab_content(config.orientation)?,
         };
         Some(island::surface(
             &config,
@@ -982,6 +1063,9 @@ impl State {
     }
     fn tab_title(tab: &Tab) -> String {
         let session = tab.session.borrow();
+        if let Some(title) = &session.manual_title {
+            return title.clone();
+        }
         let title = &session.parser.callbacks().title;
         if !title.is_empty() {
             title.clone()
@@ -1659,6 +1743,32 @@ mod tests {
         );
         assert_eq!(state.tabs.peek().len(), 2);
         assert_eq!(state.current().unwrap().session.borrow().control_mode, None);
+        state.cleanup();
+    }
+
+    #[test]
+    fn tab_names_can_be_renamed_and_restored_to_the_automatic_title() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let state = State::new(
+            crate::terminal::idle_cwd(),
+            crate::terminal::idle_command(),
+            tx,
+        );
+        state.add();
+        let tab = state.current().unwrap();
+        tab.session
+            .borrow_mut()
+            .process(b"\x1b]2;automatic\x07")
+            .unwrap();
+        state.dispatch(Action::RenameTab);
+        assert_eq!(tab.session.borrow().control_mode, Some(Mode::RenameTab));
+        state.edit_palette(|palette| palette.query = "Deploy logs".into());
+        state.rename_tab();
+        assert_eq!(State::tab_title(&tab), "Deploy logs");
+        state.dispatch(Action::RenameTab);
+        state.edit_palette(|palette| palette.query.clear());
+        state.rename_tab();
+        assert_eq!(State::tab_title(&tab), "automatic");
         state.cleanup();
     }
 

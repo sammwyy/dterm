@@ -138,6 +138,7 @@ pub struct Session {
     pub control_mode: Option<crate::island::Mode>,
     pub pending_paste: Option<String>,
     pub palette: Palette,
+    pub manual_title: Option<String>,
     master: Box<dyn MasterPty + Send>,
     input: Option<SyncSender<Vec<u8>>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -307,6 +308,7 @@ impl Session {
             control_mode: None,
             pending_paste: None,
             palette: Palette::default(),
+            manual_title: None,
             master: pair.master,
             input: Some(input),
             killer,
@@ -358,6 +360,24 @@ impl Session {
             }
             Some(crate::island::Mode::PasteConfirm) => {}
             Some(crate::island::Mode::Palette) => self.palette = Palette::default(),
+            Some(crate::island::Mode::RenameTab) => {
+                self.palette.query = self.manual_title.clone().unwrap_or_else(|| {
+                    let title = &self.parser.callbacks().title;
+                    if title.is_empty() {
+                        self.cwd
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Terminal".into())
+                    } else {
+                        title.clone()
+                    }
+                });
+                self.palette.cursor = self.palette.query.len();
+                self.palette.selection = TextSelection {
+                    anchor: 0,
+                    focus: self.palette.cursor,
+                };
+            }
             None => {
                 self.search.clear();
                 self.pending_paste = None;
@@ -369,6 +389,7 @@ impl Session {
             Some(crate::island::Mode::Search) => self.search.refresh(self.parser.screen()),
             Some(crate::island::Mode::PasteConfirm) => {}
             Some(crate::island::Mode::Palette) => {}
+            Some(crate::island::Mode::RenameTab) => {}
             None => {}
         }
     }
