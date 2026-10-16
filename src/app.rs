@@ -37,6 +37,7 @@ struct Tab {
     island_scroll: ScrollController,
     panes: PaneTree,
     active_pane: Signal<u64>,
+    broadcast_input: Signal<bool>,
 }
 
 #[derive(Clone)]
@@ -211,6 +212,7 @@ impl Tab {
             selection: pane.selection.clone(),
             island_scroll: pane.island_scroll.clone(),
             active_pane: Signal::new(pane.id),
+            broadcast_input: Signal::new(false),
             panes: PaneTree::Pane(pane),
         }
     }
@@ -230,6 +232,17 @@ impl Tab {
         self.island_scroll = pane.island_scroll;
         self.active_pane.set(id);
         true
+    }
+
+    fn input_panes(&self) -> Vec<Pane> {
+        if self.broadcast_input.peek() {
+            self.all_panes()
+        } else {
+            self.panes
+                .pane(self.active_pane.peek())
+                .into_iter()
+                .collect()
+        }
     }
 }
 #[derive(Clone)]
@@ -582,36 +595,57 @@ impl State {
                 self.activate_mode(Mode::PasteConfirm);
                 return;
             }
-            let result = {
-                let mut session = tab.session.borrow_mut();
-                let bracketed = session.parser.screen().bracketed_paste();
-                session.parser.screen_mut().set_scrollback(0);
-                session.write(crate::input::paste(text, bracketed))
-            };
-            self.input_changed(&tab, result);
+            self.paste_into_panes(&tab, text);
         }
     }
     fn confirm_paste(&self) {
         let Some(tab) = self.current() else {
             return;
         };
-        let result = {
+        let text = {
             let mut session = tab.session.borrow_mut();
             let Some(text) = session.pending_paste.take() else {
                 return;
             };
-            let bracketed = session.parser.screen().bracketed_paste();
-            session.parser.screen_mut().set_scrollback(0);
             session.control_mode = None;
-            session.write(crate::input::paste(&text, bracketed))
+            text
         };
-        self.input_changed(&tab, result);
+        self.paste_into_panes(&tab, &text);
+    }
+    fn paste_into_panes(&self, tab: &Tab, text: &str) {
+        let results = tab
+            .input_panes()
+            .into_iter()
+            .map(|pane| {
+                let result = {
+                    let mut session = pane.session.borrow_mut();
+                    let bracketed = session.parser.screen().bracketed_paste();
+                    session.parser.screen_mut().set_scrollback(0);
+                    session.write(crate::input::paste(text, bracketed))
+                };
+                (pane, result)
+            })
+            .collect();
+        self.input_changed_many(results);
     }
     /// Signals can redraw synchronously: callers must release the session first.
     fn input_changed(&self, tab: &Tab, result: anyhow::Result<()>) {
+        self.input_changed_many(vec![(
+            Pane {
+                id: tab.active_pane.peek(),
+                session: tab.session.clone(),
+                selection: tab.selection.clone(),
+                island_scroll: tab.island_scroll.clone(),
+            },
+            result,
+        )]);
+    }
+    fn input_changed_many(&self, results: Vec<(Pane, anyhow::Result<()>)>) {
         creamui_reactive::batch(|| {
-            tab.selection.set(None);
-            self.report(result);
+            for (pane, result) in results {
+                pane.selection.set(None);
+                self.report(result);
+            }
             self.revision.update(|v| *v = v.wrapping_add(1));
         });
     }
@@ -787,20 +821,31 @@ impl State {
             return true;
         }
         if let Some(tab) = self.current() {
-            let result = {
-                let mut session = tab.session.borrow_mut();
-                let bytes = crate::input::encode(
-                    &event.key,
-                    m,
-                    session.parser.screen().application_cursor(),
-                );
-                if bytes.is_empty() {
-                    return true;
-                }
-                session.parser.screen_mut().set_scrollback(0);
-                session.write(bytes)
-            };
-            self.input_changed(&tab, result);
+            let mut sent = false;
+            let results = tab
+                .input_panes()
+                .into_iter()
+                .filter_map(|pane| {
+                    let result = {
+                        let mut session = pane.session.borrow_mut();
+                        let bytes = crate::input::encode(
+                            &event.key,
+                            m,
+                            session.parser.screen().application_cursor(),
+                        );
+                        if bytes.is_empty() {
+                            return None;
+                        }
+                        sent = true;
+                        session.parser.screen_mut().set_scrollback(0);
+                        session.write(bytes)
+                    };
+                    Some((pane, result))
+                })
+                .collect();
+            if sent {
+                self.input_changed_many(results);
+            }
         }
         true
     }
@@ -926,6 +971,12 @@ impl State {
                     {
                         self.revision.update(|value| *value = value.wrapping_add(1));
                     }
+                }
+            }
+            Action::ToggleBroadcastInput => {
+                if let Some(tab) = self.current() {
+                    tab.broadcast_input.update(|enabled| *enabled = !*enabled);
+                    self.revision.update(|value| *value = value.wrapping_add(1));
                 }
             }
             Action::Settings => open_settings(),
@@ -2014,6 +2065,32 @@ mod tests {
             assert_eq!(tab.all_panes().len(), 2);
             let second = tab.session.borrow().id;
             assert_ne!(second, first);
+
+            state.dispatch(Action::ToggleBroadcastInput);
+            let tab = state.current().unwrap();
+            assert!(tab.broadcast_input.peek());
+            assert_eq!(tab.input_panes().len(), 2);
+            for pane in tab.all_panes() {
+                let mut session = pane.session.borrow_mut();
+                session.resize(2, 20).unwrap();
+                session.process(b"one\r\ntwo\r\nthree").unwrap();
+                session.parser.screen_mut().set_scrollback(1);
+            }
+            state.key(
+                KeyEvent {
+                    key: Key::Character("x".into()),
+                    pressed: true,
+                    synthetic: false,
+                },
+                Modifiers::default(),
+            );
+            assert!(tab.all_panes().iter().all(|pane| pane
+                .session
+                .borrow()
+                .parser
+                .screen()
+                .scrollback()
+                == 0));
 
             state.dispatch(Action::GrowPane);
             let tab = state.current().unwrap();
