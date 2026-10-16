@@ -454,6 +454,26 @@ impl State {
                         }
                     }
                 },
+                Mode::SaveOutput => match event.key {
+                    Key::Enter => self.save_output(),
+                    _ => {
+                        if let Some(key) = search_key(&event.key) {
+                            if let Some(editor) = self.palette_editor() {
+                                if let Some(handler) = editor.on_key() {
+                                    handler(creamui_core::KeyInput {
+                                        key,
+                                        modifiers: creamui_core::Modifiers {
+                                            ctrl: m.ctrl,
+                                            shift: m.shift,
+                                            alt: m.alt,
+                                            logo: m.logo,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                },
             }
             return true;
         }
@@ -534,6 +554,7 @@ impl State {
             Action::Search => self.activate_mode(Mode::Search),
             Action::Palette => self.activate_mode(Mode::Palette),
             Action::RenameTab => self.activate_mode(Mode::RenameTab),
+            Action::SaveOutput => self.activate_mode(Mode::SaveOutput),
             Action::Settings => open_settings(),
             Action::ScrollUp | Action::ScrollDown => {
                 if let Some(tab) = self.current() {
@@ -574,7 +595,21 @@ impl State {
             return;
         }
         if let Some(tab) = self.current() {
-            tab.session.borrow_mut().set_mode(Some(mode));
+            let mut session = tab.session.borrow_mut();
+            session.set_mode(Some(mode));
+            if mode == Mode::SaveOutput {
+                session.palette.query = session
+                    .cwd
+                    .join("terminal-output.txt")
+                    .to_string_lossy()
+                    .into_owned();
+                session.palette.cursor = session.palette.query.len();
+                session.palette.selection = creamui_widgets::TextSelection {
+                    anchor: 0,
+                    focus: session.palette.cursor,
+                };
+            }
+            drop(session);
             creamui_reactive::batch(|| {
                 tab.island_scroll.set(0.0);
                 self.revision.update(|v| *v = v.wrapping_add(1));
@@ -597,6 +632,34 @@ impl State {
             self.persist_session();
             self.revision.update(|value| *value = value.wrapping_add(1));
         }
+    }
+    fn save_output(&self) {
+        let Some(tab) = self.current() else {
+            return;
+        };
+        let result = {
+            let mut session = tab.session.borrow_mut();
+            let raw_path = session.palette.query.trim();
+            if raw_path.is_empty() {
+                Err(anyhow::anyhow!("Enter a file path for terminal output"))
+            } else {
+                let path = PathBuf::from(raw_path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    session.cwd.join(path)
+                };
+                let result = crate::terminal::save_output(&path, session.parser.screen());
+                if result.is_ok() {
+                    session.control_mode = None;
+                }
+                result
+            }
+        };
+        if result.is_ok() {
+            self.revision.update(|value| *value = value.wrapping_add(1));
+        }
+        self.report(result);
     }
     fn navigate_search(&self, previous: bool) {
         if let Some(tab) = self.current() {
@@ -701,18 +764,21 @@ impl State {
             }),
         )
     }
-    fn palette_input(&self) -> Option<crate::search::SearchInput> {
+    fn palette_input_with(&self, placeholder: &str) -> Option<crate::search::SearchInput> {
         let editor = self.palette_editor()?;
         let theme = use_theme();
         Some(crate::search::SearchInput(
             editor
                 .color(theme.colors.text_primary)
-                .placeholder("Type an action…", theme.colors.text_secondary)
+                .placeholder(placeholder, theme.colors.text_secondary)
                 .background(theme.colors.surface)
                 .corner_radius(6.0)
                 .border(theme.colors.accent, 1.0)
                 .selection_background(theme.colors.accent.mix(theme.colors.surface, 0.5)),
         ))
+    }
+    fn palette_input(&self) -> Option<crate::search::SearchInput> {
+        self.palette_input_with("Type an action…")
     }
     fn palette_actions(&self) -> Vec<Action> {
         let query = self
@@ -939,6 +1005,47 @@ impl State {
             preferred,
         ))
     }
+    fn save_output_content(&self, orientation: Orientation) -> Option<(BoxedWidget, Size)> {
+        let input = self.palette_input_with("Output file path…")?;
+        let save = self.clone();
+        let cancel = self.clone();
+        let vertical = orientation == Orientation::Vertical;
+        let preferred = if vertical {
+            Size {
+                width: 300.0,
+                height: 154.0,
+            }
+        } else {
+            Size {
+                width: 500.0,
+                height: 82.0,
+            }
+        };
+        let width = if vertical { 284.0 } else { 56.0 };
+        Some((
+            view(
+                if vertical { column(8.0) } else { row(8.0) },
+                vec![
+                    view(
+                        Style {
+                            flex_grow: 1.0,
+                            flex_basis: Dimension::Length(0.0),
+                            ..column(4.0)
+                        },
+                        vec![
+                            Box::new(Text::secondary("Save terminal output").font_size(12.0)),
+                            Box::new(input),
+                        ],
+                    ),
+                    button("Cancel", if vertical { 284.0 } else { 68.0 }, move || {
+                        cancel.close_mode()
+                    }),
+                    button("Save", width, move || save.save_output()),
+                ],
+            ),
+            preferred,
+        ))
+    }
     fn control_island(&self, area: Rect) -> Option<BoxedWidget> {
         let config = self.config.get().island;
         let tab = self.current()?;
@@ -951,6 +1058,7 @@ impl State {
             Mode::PasteConfirm => self.paste_confirmation_content(config.orientation)?,
             Mode::Palette => self.palette_content(config.orientation)?,
             Mode::RenameTab => self.rename_tab_content(config.orientation)?,
+            Mode::SaveOutput => self.save_output_content(config.orientation)?,
         };
         Some(island::surface(
             &config,
@@ -1889,6 +1997,37 @@ mod tests {
         *explicit.session_file.borrow_mut() = Some(file.clone());
         assert!(!explicit.restore_session());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_output_can_be_saved_from_its_control() {
+        let path = std::env::temp_dir().join(format!(
+            "dterm-output-{}-{:?}.txt",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let (tx, _rx) = std::sync::mpsc::sync_channel(128);
+        let state = State::new(
+            crate::terminal::idle_cwd(),
+            crate::terminal::idle_command(),
+            tx,
+        );
+        state.add();
+        let tab = state.current().unwrap();
+        tab.session
+            .borrow_mut()
+            .process(b"saved terminal output")
+            .unwrap();
+        state.dispatch(Action::SaveOutput);
+        assert_eq!(tab.session.borrow().control_mode, Some(Mode::SaveOutput));
+        state.edit_palette(|palette| palette.query = path.to_string_lossy().into_owned());
+        state.save_output();
+        assert_eq!(tab.session.borrow().control_mode, None);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("saved terminal output"));
+        std::fs::remove_file(path).unwrap();
+        state.cleanup();
     }
 
     #[test]

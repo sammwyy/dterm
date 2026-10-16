@@ -12,6 +12,7 @@ pub enum Mode {
     PasteConfirm,
     Palette,
     RenameTab,
+    SaveOutput,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -12,6 +12,69 @@ use std::{
 
 pub const SCROLLBACK: usize = 10_000;
 
+pub fn output_text(screen: &vt100::Screen) -> String {
+    let mut snapshot = screen.clone();
+    snapshot.set_scrollback(usize::MAX);
+    let history = snapshot.scrollback();
+    let (rows, cols) = snapshot.size();
+    let total = history + rows as usize;
+    let mut result = String::new();
+    let mut base = 0;
+    while base < total {
+        let top = base.min(history);
+        snapshot.set_scrollback(history - top);
+        let first = base - top;
+        let count = (rows as usize - first).min(total - base);
+        for row in first..first + count {
+            let wrapped = snapshot.row_wrapped(row as u16);
+            let mut line = String::new();
+            for col in 0..cols {
+                let Some(cell) = snapshot.cell(row as u16, col) else {
+                    continue;
+                };
+                if !cell.is_wide_continuation() {
+                    line.push_str(if cell.has_contents() {
+                        cell.contents()
+                    } else {
+                        " "
+                    });
+                }
+            }
+            if wrapped {
+                result.push_str(&line);
+            } else {
+                result.push_str(line.trim_end());
+                if base + row - first + 1 < total {
+                    result.push('\n');
+                }
+            }
+        }
+        base += count;
+    }
+    result
+}
+
+pub fn save_output(path: &Path, screen: &vt100::Screen) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Invalid output path"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".dterm-output-{}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(output_text(screen).as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(Into::into)
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionOptions {
     pub environment: BTreeMap<String, String>,
@@ -378,6 +441,7 @@ impl Session {
                     focus: self.palette.cursor,
                 };
             }
+            Some(crate::island::Mode::SaveOutput) => self.palette = Palette::default(),
             None => {
                 self.search.clear();
                 self.pending_paste = None;
@@ -390,6 +454,7 @@ impl Session {
             Some(crate::island::Mode::PasteConfirm) => {}
             Some(crate::island::Mode::Palette) => {}
             Some(crate::island::Mode::RenameTab) => {}
+            Some(crate::island::Mode::SaveOutput) => {}
             None => {}
         }
     }
@@ -430,6 +495,15 @@ mod tests {
         );
         assert_eq!(parse_osc7(b"file://remote/tmp"), None);
         assert_eq!(parse_osc7(b"invalid"), None);
+    }
+    #[test]
+    fn output_text_includes_scrollback_and_soft_wrapped_rows() {
+        let mut parser = vt100::Parser::new(2, 6, 20);
+        parser.process(b"first\r\nsecond\r\nthird");
+        assert_eq!(output_text(parser.screen()), "first\nsecond\nthird");
+        let mut wrapped = vt100::Parser::new(2, 4, 20);
+        wrapped.process(b"abcdefgh");
+        assert_eq!(output_text(wrapped.screen()), "abcdefgh");
     }
     #[cfg(unix)]
     #[test]
